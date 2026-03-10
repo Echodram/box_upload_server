@@ -35,7 +35,7 @@ HOST = '0.0.0.0'
 PORT = 40500
 BASE_DIR = 'audio_files'
 MAX_WORKERS = 200  # Handle up to 200 concurrent connections
-BUFFER_SIZE = 8192
+BUFFER_SIZE = 1024
 
 # ==================== HEADER PARSER ====================
 
