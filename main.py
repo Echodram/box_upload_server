@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 """
-Simple high-performance server for ESP32 audio uploads
-Handles thousands of concurrent uploads, parses headers, converts Opus to WAV
+Serveur simple pour recevoir les fichiers audio RAW de l'ESP32
+Format attendu: EN-TÊTE puis données audio RAW
 """
 
-import os
 import socket
-import threading
-import queue
+import os
 import datetime
-import struct
-import wave
-import tempfile
-from pathlib import Path
+import threading
 import logging
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-import subprocess
+from collections import defaultdict
+import json
 
-# Configure logging
+# Configuration du logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -26,7 +23,6 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIGURATION ====================
@@ -34,326 +30,278 @@ logger = logging.getLogger(__name__)
 HOST = '0.0.0.0'
 PORT = 40500
 BASE_DIR = 'audio_files'
-MAX_WORKERS = 200  # Handle up to 200 concurrent connections
-BUFFER_SIZE = 1024
+MAX_CONNECTIONS = 1000
+BUFFER_SIZE = 8192
 
-# ==================== HEADER PARSER ====================
-
-class HeaderParser:
-    """Simple header parser for ESP32 audio files"""
-    
-    @staticmethod
-    def parse(header_data):
-        """Parse header from bytes"""
-        header = {}
-        try:
-            lines = header_data.decode('utf-8').strip().split('\n')
-            for line in lines:
-                if ':' in line and not line.startswith('---'):
-                    key, value = line.split(':', 1)
-                    header[key.strip()] = value.strip()
-            
-            # Extract useful fields
-            result = {
-                'device_id': header.get('DEVICE', 'unknown'),
-                'mac': header.get('MAC', ''),
-                'timestamp': header.get('TIMESTAMP', ''),
-                'audio_size': int(header.get('AUDIO_SIZE', 0)),
-                'sample_rate': int(header.get('SAMPLE_RATE', 24000)),
-                'gps': header.get('GPS', ''),
-                'bluetooth': header.get('BLUETOOTH_DEVICES', ''),
-            }
-            
-            # Parse GPS if available
-            if result['gps'] and result['gps'] != '0.0,0.0':
-                gps_parts = result['gps'].split(',')
-                if len(gps_parts) >= 2:
-                    result['gps_lat'] = float(gps_parts[0])
-                    result['gps_lon'] = float(gps_parts[1])
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Header parse error: {e}")
-            return {'device_id': 'unknown'}
-
-# ==================== AUDIO CONVERTER ====================
-
-class AudioConverter:
-    """Simple Opus to WAV converter"""
-    
-    def __init__(self, output_dir='converted'):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
-        
-        # Check if ffmpeg is available
-        self.ffmpeg_available = self._check_ffmpeg()
-    
-    def _check_ffmpeg(self):
-        """Check if ffmpeg is installed"""
-        try:
-            subprocess.run(['ffmpeg', '-version'], 
-                         capture_output=True, check=True)
-            return True
-        except:
-            logger.warning("ffmpeg not found. Install with: sudo apt install ffmpeg")
-            return False
-    
-    def convert_to_wav(self, opus_data, sample_rate=24000, output_path=None):
-        """Convert Opus bytes to WAV file"""
-        if not self.ffmpeg_available:
-            logger.error("ffmpeg required for conversion")
-            return None
-        
-        if output_path is None:
-            output_path = self.output_dir / f"audio_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-        
-        try:
-            # Save raw Opus data to temp file
-            with tempfile.NamedTemporaryFile(suffix='.opus', delete=False) as f:
-                f.write(opus_data)
-                temp_opus = f.name
-            
-            # Convert using ffmpeg
-            cmd = [
-                'ffmpeg',
-                '-f', 'opus',
-                '-ar', str(sample_rate),
-                '-ac', '1',
-                '-i', temp_opus,
-                '-ar', str(sample_rate),
-                '-ac', '1',
-                '-c:a', 'pcm_s16le',
-                '-f', 'wav',
-                '-y',
-                str(output_path)
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            os.unlink(temp_opus)
-            
-            if result.returncode == 0:
-                logger.info(f"Converted to WAV: {output_path}")
-                return str(output_path)
-            else:
-                logger.error(f"Conversion failed: {result.stderr}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Conversion error: {e}")
-            return None
-
-# ==================== FILE HANDLER ====================
+# ==================== GESTIONNAIRE DE FICHIERS ====================
 
 class FileHandler:
-    """Handles saving files and queueing for conversion"""
+    """Gère la réception et le stockage des fichiers RAW"""
     
     def __init__(self, base_dir=BASE_DIR):
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(exist_ok=True)
-        self.converter = AudioConverter()
-        self.parser = HeaderParser()
+        
+        # Statistiques
         self.stats = {
             'total_files': 0,
             'total_bytes': 0,
-            'devices': {}
+            'devices': defaultdict(int),
+            'start_time': datetime.datetime.now().isoformat()
         }
         self.lock = threading.Lock()
+        
+        logger.info(f"Dossier de stockage: {self.base_dir.absolute()}")
     
-    def save_file(self, client_ip, data):
-        """Save uploaded file and return info"""
+    def parse_header(self, data):
+        """Parse l'en-tête pour extraire les informations"""
         try:
-            # Find header end
+            # Trouver la fin de l'en-tête
             header_end = data.find(b'---END HEADER---\n')
             if header_end == -1:
-                logger.error("No header found")
-                return None
+                return None, None, None, 0
             
             header_end += len(b'---END HEADER---\n')
             header_data = data[:header_end]
+            
+            # Parser l'en-tête
+            header_text = header_data.decode('utf-8', errors='ignore')
+            header_info = {}
+            
+            for line in header_text.split('\n'):
+                if ':' in line and not line.startswith('---'):
+                    key, value = line.split(':', 1)
+                    header_info[key.strip()] = value.strip()
+            
+            # Extraire les informations importantes
+            device_id = header_info.get('DEVICE', 'inconnu')
+            filename = None
+            timestamp = header_info.get('TIMESTAMP', '')
+            
+            # Le nom de fichier n'est pas dans l'en-tête, on le génère
+            return device_id, header_info, header_end
+            
+        except Exception as e:
+            logger.error(f"Erreur parsing en-tête: {e}")
+            return None, None, 0
+    
+    def generate_filename(self, device_id, timestamp=None):
+        """Génère un nom de fichier au format ISO8601"""
+        if not timestamp or timestamp == '1970-01-01T00:00:00Z':
+            # Utiliser l'heure actuelle si pas de timestamp valide
+            now = datetime.datetime.now()
+            timestamp = now.strftime("%Y%m%dT%H%M%SZ")
+        else:
+            # Nettoyer le timestamp ISO8601
+            timestamp = timestamp.replace('-', '').replace(':', '').replace('Z', '')
+        
+        return f"{device_id}_{timestamp}.raw"
+    
+    def save_file(self, data, client_ip):
+        """Sauvegarde un fichier reçu"""
+        try:
+            # Parser l'en-tête
+            device_id, header_info, header_end = self.parse_header(data)
+            
+            if not device_id:
+                logger.warning(f"En-tête invalide de {client_ip}")
+                return None
+            
+            # Extraire les données audio
             audio_data = data[header_end:]
             
-            # Parse header
-            header = self.parser.parse(header_data)
-            device_id = header['device_id']
+            # Générer le nom de fichier
+            timestamp = header_info.get('TIMESTAMP', '') if header_info else ''
+            filename = self.generate_filename(device_id, timestamp)
             
-            # Create device folder
+            # Créer le dossier pour ce device
             device_dir = self.base_dir / device_id
             device_dir.mkdir(exist_ok=True)
             
-            # Generate filename with timestamp
-            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"{device_id}_{timestamp}.raw"
+            # Chemin complet du fichier
             filepath = device_dir / filename
             
-            # Save raw file
+            # Sauvegarder le fichier
             with open(filepath, 'wb') as f:
-                f.write(data)
+                f.write(data)  # On sauvegarde tout (en-tête + audio)
             
             file_size = len(data)
+            audio_size = len(audio_data)
             
-            # Update stats
+            # Mettre à jour les statistiques
             with self.lock:
                 self.stats['total_files'] += 1
                 self.stats['total_bytes'] += file_size
-                if device_id not in self.stats['devices']:
-                    self.stats['devices'][device_id] = 0
                 self.stats['devices'][device_id] += 1
             
-            logger.info(f"Saved: {filename} from {device_id} ({file_size} bytes)")
-            
-            # Queue for conversion (in background thread)
-            threading.Thread(
-                target=self._convert_in_background,
-                args=(audio_data, header, device_id, timestamp),
-                daemon=True
-            ).start()
+            logger.info(f"✅ {device_id} - {filename} ({audio_size} bytes audio, {file_size} total)")
             
             return {
-                'filename': filename,
                 'device_id': device_id,
+                'filename': filename,
+                'filepath': str(filepath),
                 'size': file_size,
-                'header': header
+                'audio_size': audio_size,
+                'timestamp': timestamp
             }
             
         except Exception as e:
-            logger.error(f"Save error: {e}")
+            logger.error(f"Erreur sauvegarde fichier de {client_ip}: {e}")
             return None
+
+# ==================== GESTIONNAIRE DE CONNEXIONS ====================
+
+class ConnectionManager:
+    """Gère les connexions entrantes"""
     
-    def _convert_in_background(self, audio_data, header, device_id, timestamp):
-        """Convert audio in background thread"""
-        try:
-            sample_rate = header.get('sample_rate', 24000)
+    def __init__(self, max_connections=MAX_CONNECTIONS):
+        self.max_connections = max_connections
+        self.active_connections = 0
+        self.connections_per_ip = defaultdict(int)
+        self.lock = threading.Lock()
+    
+    def can_accept(self, client_ip):
+        """Vérifie si on peut accepter une nouvelle connexion"""
+        with self.lock:
+            if self.active_connections >= self.max_connections:
+                logger.warning("Nombre max de connexions atteint")
+                return False
             
-            # Create device subfolder in converted directory
-            conv_dir = self.converter.output_dir / device_id
-            conv_dir.mkdir(exist_ok=True)
-            
-            # Generate output filename
-            wav_filename = f"{device_id}_{timestamp}.wav"
-            wav_path = conv_dir / wav_filename
-            
-            # Convert
-            result = self.converter.convert_to_wav(
-                audio_data, 
-                sample_rate, 
-                str(wav_path)
-            )
-            
-            if result:
-                logger.info(f"Background conversion complete: {wav_filename}")
-            
-        except Exception as e:
-            logger.error(f"Background conversion error: {e}")
+            self.active_connections += 1
+            self.connections_per_ip[client_ip] += 1
+            return True
+    
+    def connection_closed(self, client_ip):
+        """Notifie la fermeture d'une connexion"""
+        with self.lock:
+            self.active_connections -= 1
+            self.connections_per_ip[client_ip] -= 1
+            if self.connections_per_ip[client_ip] <= 0:
+                del self.connections_per_ip[client_ip]
 
-# ==================== CLIENT HANDLER ====================
+# ==================== GESTIONNAIRE CLIENT ====================
 
-def handle_client(client_socket, client_address, file_handler):
-    """Handle single client connection"""
+def handle_client(client_socket, client_address, file_handler, conn_manager):
+    """Gère une connexion client"""
     client_ip = client_address[0]
     
+    if not conn_manager.can_accept(client_ip):
+        client_socket.close()
+        return
+    
     try:
-        # Set timeout
+        # Timeout de 30 secondes
         client_socket.settimeout(30)
         
-        # Receive all data
+        # Recevoir toutes les données
         data = b''
         while True:
-            chunk = client_socket.recv(BUFFER_SIZE)
-            if not chunk:
-                break
-            data += chunk
-            
-            # Simple check for complete file (can be improved)
-            if len(data) > 10 * 1024 * 1024:  # 10MB max
-                logger.warning(f"File too large from {client_ip}")
+            try:
+                chunk = client_socket.recv(BUFFER_SIZE)
+                if not chunk:
+                    break
+                data += chunk
+                
+                # Limite de taille (10MB max)
+                if len(data) > 10 * 1024 * 1024:
+                    logger.warning(f"Fichier trop grand de {client_ip}")
+                    break
+                    
+            except socket.timeout:
+                logger.debug(f"Timeout de {client_ip}, fin de réception")
                 break
         
-        if len(data) < 100:  # Too small
-            logger.warning(f"Empty or too small file from {client_ip}")
+        if len(data) < 100:
+            logger.warning(f"Données trop petites de {client_ip}")
             return
         
-        # Process file
-        result = file_handler.save_file(client_ip, data)
+        # Sauvegarder le fichier
+        result = file_handler.save_file(data, client_ip)
         
         if result:
-            # Send success response
-            response = f"ACK:File {result['filename']} received OK\n"
+            # Réponse de succès
+            response = f"ACK:{result['filename']}\n"
             client_socket.send(response.encode())
-            logger.info(f"✓ {client_ip} - {result['device_id']} - {result['filename']}")
+            logger.info(f"✓ Réponse envoyée à {client_ip}")
         else:
-            # Send error response
-            client_socket.send(b"ERROR:Processing failed\n")
-            logger.warning(f"✗ {client_ip} - Processing failed")
+            client_socket.send(b"ERROR:Invalid file\n")
             
-    except socket.timeout:
-        logger.error(f"Timeout from {client_ip}")
     except Exception as e:
-        logger.error(f"Error with {client_ip}: {e}")
+        logger.error(f"Erreur avec {client_ip}: {e}")
     finally:
         client_socket.close()
+        conn_manager.connection_closed(client_ip)
 
-# ==================== MAIN SERVER ====================
+# ==================== SERVEUR PRINCIPAL ====================
+
+def print_stats(file_handler):
+    """Affiche les statistiques périodiquement"""
+    while True:
+        time.sleep(60)  # Toutes les minutes
+        stats = file_handler.stats
+        uptime = datetime.datetime.now() - datetime.datetime.fromisoformat(stats['start_time'])
+        
+        logger.info("-" * 60)
+        logger.info(f"STATISTIQUES - Uptime: {str(uptime).split('.')[0]}")
+        logger.info(f"  Fichiers reçus: {stats['total_files']}")
+        logger.info(f"  Données totales: {stats['total_bytes'] / 1024 / 1024:.1f} MB")
+        logger.info(f"  Appareils actifs: {len(stats['devices'])}")
+        
+        # Top 5 appareils
+        if stats['devices']:
+            logger.info("  Top appareils:")
+            top_devices = sorted(stats['devices'].items(), key=lambda x: x[1], reverse=True)[:5]
+            for device, count in top_devices:
+                logger.info(f"    {device}: {count} fichiers")
+        logger.info("-" * 60)
 
 def start_server():
-    """Start the high-performance server"""
+    """Démarre le serveur"""
     
-    # Create file handler
+    # Initialiser les gestionnaires
     file_handler = FileHandler()
+    conn_manager = ConnectionManager()
     
-    # Create socket
+    # Créer le socket
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
     
     try:
         server.bind((HOST, PORT))
-        server.listen(1000)
+        server.listen(100)
         
         logger.info("=" * 60)
-        logger.info("SIMPLE AUDIO SERVER STARTED")
+        logger.info("SERVEUR AUDIO RAW DÉMARRÉ")
         logger.info("=" * 60)
-        logger.info(f"Host: {HOST}:{PORT}")
-        logger.info(f"Storage: {BASE_DIR}")
-        logger.info(f"Max workers: {MAX_WORKERS}")
+        logger.info(f"Hôte: {HOST}:{PORT}")
+        logger.info(f"Stockage: {BASE_DIR}")
+        logger.info(f"Connexions max: {MAX_CONNECTIONS}")
         logger.info("=" * 60)
         
-        # Thread pool for handling clients
-        executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        # Thread pool pour les connexions
+        executor = ThreadPoolExecutor(max_workers=50)
         
-        # Stats printing thread
-        def print_stats():
-            while True:
-                import time
-                time.sleep(60)
-                stats = file_handler.stats
-                logger.info("-" * 60)
-                logger.info(f"STATS - Total files: {stats['total_files']}")
-                logger.info(f"STATS - Total bytes: {stats['total_bytes'] / 1024 / 1024:.1f} MB")
-                logger.info(f"STATS - Active devices: {len(stats['devices'])}")
-                logger.info("-" * 60)
+        # Thread pour les statistiques
+        threading.Thread(target=print_stats, args=(file_handler,), daemon=True).start()
         
-        threading.Thread(target=print_stats, daemon=True).start()
-        
-        # Main accept loop
+        # Boucle principale
         while True:
             client, address = server.accept()
-            executor.submit(handle_client, client, address, file_handler)
+            executor.submit(handle_client, client, address, file_handler, conn_manager)
             
     except KeyboardInterrupt:
-        logger.info("Shutting down...")
+        logger.info("Arrêt demandé...")
     except Exception as e:
-        logger.error(f"Server error: {e}")
+        logger.error(f"Erreur serveur: {e}")
     finally:
         server.close()
-        executor.shutdown(wait=True)
-        logger.info("Server stopped")
+        executor.shutdown(wait=False)
+        logger.info("Serveur arrêté")
 
-
-
-# ==================== MAIN ====================
+# ==================== POINT D'ENTRÉE ====================
 
 if __name__ == "__main__":
+    import time
     start_server()
