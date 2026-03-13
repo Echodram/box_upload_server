@@ -211,6 +211,8 @@ class FileProcessor:
             
             # Verify file integrity
             if self.verify_file(file_path, file_size):
+                if file_path.suffix.lower() == '.txt':
+                    self.process_metadata_txt(file_path, file_info)
                 return True
             else:
                 logging.error(f"File verification failed: {file_info['filename']}")
@@ -223,6 +225,67 @@ class FileProcessor:
             if file_path.exists():
                 file_path.unlink()
             return False
+
+    def process_metadata_txt(self, file_path, file_info):
+        """Parse ESP32 metadata txt and write a normalized JSON companion file."""
+        try:
+            parsed = {
+                'source_file': file_info['original_filename'],
+                'saved_file': file_info['filename'],
+                'device_id': file_info['device_key'],
+                'received_at': datetime.datetime.now().isoformat(),
+                'audio_file': None,
+                'latitude': None,
+                'longitude': None,
+                'bluetooth_count': 0,
+                'bluetooth_devices': []
+            }
+
+            pending_ble_name = None
+
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or '=' not in line:
+                        continue
+
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+
+                    if key == 'audio_file':
+                        parsed['audio_file'] = value
+                    elif key == 'latitude':
+                        parsed['latitude'] = None if value == 'NA' else float(value)
+                    elif key == 'longitude':
+                        parsed['longitude'] = None if value == 'NA' else float(value)
+                    elif key == 'bluetooth_count':
+                        try:
+                            parsed['bluetooth_count'] = int(value)
+                        except ValueError:
+                            parsed['bluetooth_count'] = 0
+                    elif key == 'ble_name':
+                        pending_ble_name = value
+                    elif key == 'ble_mac':
+                        parsed['bluetooth_devices'].append({
+                            'name': pending_ble_name or 'UNKNOWN',
+                            'mac': value
+                        })
+                        pending_ble_name = None
+
+            json_path = file_path.with_suffix('.json')
+            with open(json_path, 'w', encoding='utf-8') as jf:
+                json.dump(parsed, jf, indent=2)
+
+            logging.info(
+                "METADATA - Parsed %s: lat=%s lon=%s ble=%d",
+                file_info['filename'],
+                parsed['latitude'],
+                parsed['longitude'],
+                len(parsed['bluetooth_devices'])
+            )
+        except Exception as e:
+            logging.error(f"Failed to parse metadata txt {file_info['filename']}: {e}")
     
     def verify_file(self, file_path, expected_size):
         """Verify file was written correctly"""
