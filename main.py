@@ -1,170 +1,124 @@
-#!/usr/bin/env python3
-"""
-Serveur simple pour recevoir les fichiers audio RAW de l'ESP32
-Format attendu: EN-TÊTE puis données audio RAW
-"""
-
 import socket
 import os
 import datetime
 import threading
-import logging
+import queue
+import time
 from pathlib import Path
+import select
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
+import hashlib
 import json
 
-# Configuration du logging
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('audio_server.log'),
+        logging.FileHandler('opus_server.log'),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger(__name__)
 
-# ==================== CONFIGURATION ====================
-
-HOST = '0.0.0.0'
-PORT = 40500
-BASE_DIR = 'audio_files'
-MAX_CONNECTIONS = 1000
-BUFFER_SIZE = 8192
-
-# ==================== GESTIONNAIRE DE FICHIERS ====================
-
-class FileHandler:
-    """Gère la réception et le stockage des fichiers RAW"""
-    
-    def __init__(self, base_dir=BASE_DIR):
-        self.base_dir = Path(base_dir)
-        self.base_dir.mkdir(exist_ok=True)
-        
-        # Statistiques
-        self.stats = {
-            'total_files': 0,
-            'total_bytes': 0,
-            'devices': defaultdict(int),
-            'start_time': datetime.datetime.now().isoformat()
-        }
+class DeviceManager:
+    """Manages device folders and configurations"""
+    def __init__(self, base_directory='received_files'):
+        self.base_directory = Path(base_directory)
+        self.devices_directory = self.base_directory / 'devices'
+        self.device_folders = {}
+        self.device_info_file = self.base_directory / 'devices.json'
         self.lock = threading.Lock()
+        self.load_device_info()
         
-        logger.info(f"Dossier de stockage: {self.base_dir.absolute()}")
-    
-    def parse_header(self, data):
-        """Parse l'en-tête pour extraire les informations"""
+    def load_device_info(self):
+        """Load device information from JSON file"""
         try:
-            # Trouver la fin de l'en-tête
-            header_end = data.find(b'---END HEADER---\n')
-            if header_end == -1:
-                return None, None, None, 0
-            
-            header_end += len(b'---END HEADER---\n')
-            header_data = data[:header_end]
-            
-            # Parser l'en-tête
-            header_text = header_data.decode('utf-8', errors='ignore')
-            header_info = {}
-            
-            for line in header_text.split('\n'):
-                if ':' in line and not line.startswith('---'):
-                    key, value = line.split(':', 1)
-                    header_info[key.strip()] = value.strip()
-            
-            # Extraire les informations importantes
-            device_id = header_info.get('DEVICE', 'inconnu')
-            filename = None
-            timestamp = header_info.get('TIMESTAMP', '')
-            
-            # Le nom de fichier n'est pas dans l'en-tête, on le génère
-            return device_id, header_info, header_end
-            
+            if self.device_info_file.exists():
+                with open(self.device_info_file, 'r') as f:
+                    self.device_folders = json.load(f)
+                logging.info(f"Loaded {len(self.device_folders)} devices from registry")
         except Exception as e:
-            logger.error(f"Erreur parsing en-tête: {e}")
-            return None, None, 0
+            logging.error(f"Error loading device info: {e}")
+            self.device_folders = {}
     
-    def generate_filename(self, device_id, timestamp=None):
-        """Génère un nom de fichier au format ISO8601"""
-        if not timestamp or timestamp == '1970-01-01T00:00:00Z':
-            # Utiliser l'heure actuelle si pas de timestamp valide
-            now = datetime.datetime.now()
-            timestamp = now.strftime("%Y%m%dT%H%M%SZ")
+    def save_device_info(self):
+        """Save device information to JSON file"""
+        try:
+            with open(self.device_info_file, 'w') as f:
+                json.dump(self.device_folders, f, indent=2)
+        except Exception as e:
+            logging.error(f"Error saving device info: {e}")
+    
+    def get_device_folder(self, client_address, device_id=None):
+        """Get or create folder for a specific device"""
+        client_ip = client_address[0]
+        
+        # Use provided device ID or generate one from IP
+        if device_id:
+            device_key = device_id
         else:
-            # Nettoyer le timestamp ISO8601
-            timestamp = timestamp.replace('-', '').replace(':', '').replace('Z', '')
+            device_key = f"device_{client_ip.replace('.', '_')}"
         
-        return f"{device_id}_{timestamp}.raw"
+        with self.lock:
+            if device_key not in self.device_folders:
+                # Create new device entry
+                folder_name = device_key
+                folder_path = self.devices_directory / folder_name
+                folder_path.mkdir(parents=True, exist_ok=True)
+                
+                self.device_folders[device_key] = {
+                    'folder_name': folder_name,
+                    'folder_path': str(folder_path),
+                    'ip_address': client_ip,
+                    'first_seen': datetime.datetime.now().isoformat(),
+                    'last_seen': datetime.datetime.now().isoformat(),
+                    'files_received': 0
+                }
+                self.save_device_info()
+                logging.info(f"Created new device folder: {folder_name} for IP {client_ip}")
+            else:
+                # Update last seen timestamp
+                self.device_folders[device_key]['last_seen'] = datetime.datetime.now().isoformat()
+                self.device_folders[device_key]['ip_address'] = client_ip
+            
+            return Path(self.device_folders[device_key]['folder_path'])
     
-    def save_file(self, data, client_ip):
-        """Sauvegarde un fichier reçu"""
-        try:
-            # Parser l'en-tête
-            device_id, header_info, header_end = self.parse_header(data)
-            
-            if not device_id:
-                logger.warning(f"En-tête invalide de {client_ip}")
-                return None
-            
-            # Extraire les données audio
-            audio_data = data[header_end:]
-            
-            # Générer le nom de fichier
-            timestamp = header_info.get('TIMESTAMP', '') if header_info else ''
-            filename = self.generate_filename(device_id, timestamp)
-            
-            # Créer le dossier pour ce device
-            device_dir = self.base_dir / device_id
-            device_dir.mkdir(exist_ok=True)
-            
-            # Chemin complet du fichier
-            filepath = device_dir / filename
-            
-            # Sauvegarder le fichier
-            with open(filepath, 'wb') as f:
-                f.write(data)  # On sauvegarde tout (en-tête + audio)
-            
-            file_size = len(data)
-            audio_size = len(audio_data)
-            
-            # Mettre à jour les statistiques
-            with self.lock:
-                self.stats['total_files'] += 1
-                self.stats['total_bytes'] += file_size
-                self.stats['devices'][device_id] += 1
-            
-            logger.info(f"✅ {device_id} - {filename} ({audio_size} bytes audio, {file_size} total)")
-            
+    def increment_file_count(self, device_key):
+        """Increment file count for a device"""
+        with self.lock:
+            if device_key in self.device_folders:
+                self.device_folders[device_key]['files_received'] += 1
+                self.device_folders[device_key]['last_seen'] = datetime.datetime.now().isoformat()
+                self.save_device_info()
+    
+    def get_device_stats(self):
+        """Get statistics for all devices"""
+        with self.lock:
             return {
-                'device_id': device_id,
-                'filename': filename,
-                'filepath': str(filepath),
-                'size': file_size,
-                'audio_size': audio_size,
-                'timestamp': timestamp
+                'total_devices': len(self.device_folders),
+                'devices': self.device_folders
             }
-            
-        except Exception as e:
-            logger.error(f"Erreur sauvegarde fichier de {client_ip}: {e}")
-            return None
-
-# ==================== GESTIONNAIRE DE CONNEXIONS ====================
 
 class ConnectionManager:
-    """Gère les connexions entrantes"""
-    
-    def __init__(self, max_connections=MAX_CONNECTIONS):
+    """Manages client connections and prevents overload"""
+    def __init__(self, max_connections=10000, max_concurrent_per_ip=10):
         self.max_connections = max_connections
+        self.max_concurrent_per_ip = max_concurrent_per_ip
         self.active_connections = 0
         self.connections_per_ip = defaultdict(int)
         self.lock = threading.Lock()
-    
-    def can_accept(self, client_ip):
-        """Vérifie si on peut accepter une nouvelle connexion"""
+        
+    def can_accept_connection(self, client_ip):
+        """Check if we can accept a new connection from this IP"""
         with self.lock:
             if self.active_connections >= self.max_connections:
-                logger.warning("Nombre max de connexions atteint")
+                logging.warning(f"Max connections reached ({self.max_connections})")
+                return False
+            
+            if self.connections_per_ip[client_ip] >= self.max_concurrent_per_ip:
+                logging.warning(f"Max concurrent connections reached for IP {client_ip}")
                 return False
             
             self.active_connections += 1
@@ -172,136 +126,354 @@ class ConnectionManager:
             return True
     
     def connection_closed(self, client_ip):
-        """Notifie la fermeture d'une connexion"""
+        """Notify that a connection has closed"""
         with self.lock:
             self.active_connections -= 1
             self.connections_per_ip[client_ip] -= 1
             if self.connections_per_ip[client_ip] <= 0:
                 del self.connections_per_ip[client_ip]
 
-# ==================== GESTIONNAIRE CLIENT ====================
-
-def handle_client(client_socket, client_address, file_handler, conn_manager):
-    """Gère une connexion client"""
-    client_ip = client_address[0]
-    
-    if not conn_manager.can_accept(client_ip):
-        client_socket.close()
-        return
-    
-    try:
-        # Timeout de 30 secondes
-        client_socket.settimeout(30)
+class FileProcessor:
+    """Handles file writing with queue-based processing"""
+    def __init__(self, device_manager, max_workers=50):
+        self.device_manager = device_manager
+        self.file_queue = queue.Queue(maxsize=10000)
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.running = True
         
-        # Recevoir toutes les données
-        data = b''
-        while True:
+        # Start file processing threads
+        for i in range(max_workers):
+            threading.Thread(target=self._process_files, daemon=True, name=f"FileProcessor-{i}").start()
+    
+    def queue_file(self, filename, file_data, client_address, device_id=None):
+        """Queue a file for processing"""
+        try:
+            # Get device folder
+            device_folder = self.device_manager.get_device_folder(client_address, device_id)
+            device_key = device_folder.name
+            
+            # Add timestamp to avoid conflicts
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            name_parts = filename.rsplit('.', 1)
+            if len(name_parts) == 2:
+                unique_filename = f"{name_parts[0]}_{timestamp}.{name_parts[1]}"
+            else:
+                unique_filename = f"{filename}_{timestamp}"
+            
+            file_info = {
+                'filename': unique_filename,
+                'original_filename': filename,
+                'data': file_data,
+                'client_address': client_address,
+                'device_folder': device_folder,
+                'device_key': device_key,
+                'timestamp': timestamp
+            }
+            
+            self.file_queue.put(file_info, timeout=1)
+            return unique_filename
+            
+        except queue.Full:
+            logging.error("File queue is full, dropping file")
+            return None
+    
+    def _process_files(self):
+        """Process files from the queue"""
+        while self.running:
             try:
-                chunk = client_socket.recv(BUFFER_SIZE)
+                file_info = self.file_queue.get(timeout=1)
+                if file_info is None:
+                    break
+                
+                self._save_file(file_info)
+                self.file_queue.task_done()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logging.error(f"Error processing file: {e}")
+    
+    def _save_file(self, file_info):
+        """Save file to device-specific folder"""
+        file_path = file_info['device_folder'] / file_info['filename']
+        
+        try:
+            with open(file_path, 'wb') as f:
+                f.write(file_info['data'])
+            
+            file_size = len(file_info['data'])
+            
+            # Update device statistics
+            self.device_manager.increment_file_count(file_info['device_key'])
+            
+            logging.info(f"SUCCESS - Saved: {file_info['filename']} ({file_size} bytes) to device {file_info['device_key']} from {file_info['client_address']}")
+            
+            # Verify file integrity
+            if self.verify_file(file_path, file_size):
+                return True
+            else:
+                logging.error(f"File verification failed: {file_info['filename']}")
+                if file_path.exists():
+                    file_path.unlink()
+                return False
+                
+        except Exception as e:
+            logging.error(f"Error saving file {file_info['filename']}: {e}")
+            if file_path.exists():
+                file_path.unlink()
+            return False
+    
+    def verify_file(self, file_path, expected_size):
+        """Verify file was written correctly"""
+        try:
+            actual_size = file_path.stat().st_size
+            return actual_size == expected_size
+        except Exception as e:
+            logging.error(f"File verification error: {e}")
+            return False
+    
+    def stop(self):
+        """Stop file processing"""
+        self.running = False
+        self.executor.shutdown(wait=True)
+
+class OpusFileServer:
+    def __init__(self, host='0.0.0.0', port=8080, base_directory='received_files', 
+                 max_connections=10000, max_workers=50):
+        self.host = host
+        self.port = port
+        self.device_manager = DeviceManager(base_directory)
+        self.connection_manager = ConnectionManager(max_connections)
+        self.file_processor = FileProcessor(self.device_manager, max_workers)
+        self.server_socket = None
+        self.running = False
+        self.stats = {
+            'files_received': 0,
+            'connections_handled': 0,
+            'errors': 0,
+            'start_time': None
+        }
+    
+    def parse_header(self, data):
+        """Parse the header data to extract filename, size, and device ID"""
+        try:
+            header_str = data.decode('utf-8', errors='ignore')
+            lines = header_str.split('\n')
+            header_line = lines[0]
+            
+            parts = header_line.strip().split()
+            filename = None
+            file_size = None
+            device_id = None
+            
+            for part in parts:
+                if part.startswith('FILE:'):
+                    filename = part[5:]
+                elif part.startswith('SIZE:'):
+                    file_size = int(part[5:])
+                elif part.startswith('DEVICE:'):
+                    device_id = part[7:]
+            
+            return filename, file_size, device_id, len(header_line) + 1  # +1 for newline
+            
+        except Exception as e:
+            logging.error(f"Error parsing header: {e}")
+            return None, None, None, 0
+    
+    def receive_file_data(self, client_socket, file_size, header_size):
+        """Receive file data with timeout and chunking"""
+        try:
+            client_socket.settimeout(30.0)  # 30 second timeout for data transfer
+            
+            bytes_received = 0
+            file_data = bytearray()
+            
+            while bytes_received < file_size:
+                chunk_size = min(8192, file_size - bytes_received)
+                chunk = client_socket.recv(chunk_size)
                 if not chunk:
                     break
-                data += chunk
-                
-                # Limite de taille (10MB max)
-                if len(data) > 10 * 1024 * 1024:
-                    logger.warning(f"Fichier trop grand de {client_ip}")
-                    break
-                    
-            except socket.timeout:
-                logger.debug(f"Timeout de {client_ip}, fin de réception")
-                break
+                file_data.extend(chunk)
+                bytes_received += len(chunk)
+            
+            return bytes(file_data)
+            
+        except socket.timeout:
+            logging.error("Timeout while receiving file data")
+            return None
+        except Exception as e:
+            logging.error(f"Error receiving file data: {e}")
+            return None
+    
+    def handle_client(self, client_socket, client_address):
+        """Handle a single client connection"""
+        client_ip = client_address[0]
         
-        if len(data) < 100:
-            logger.warning(f"Données trop petites de {client_ip}")
+        # Check if we can accept this connection
+        if not self.connection_manager.can_accept_connection(client_ip):
+            client_socket.close()
             return
         
-        # Sauvegarder le fichier
-        result = file_handler.save_file(data, client_ip)
-        
-        if result:
-            # Réponse de succès
-            response = f"ACK:{result['filename']}\n"
-            client_socket.send(response.encode())
-            logger.info(f"✓ Réponse envoyée à {client_ip}")
-        else:
-            client_socket.send(b"ERROR:Invalid file\n")
+        try:
+            logging.info(f"New connection from: {client_address}")
+            self.stats['connections_handled'] += 1
             
-    except Exception as e:
-        logger.error(f"Erreur avec {client_ip}: {e}")
-    finally:
-        client_socket.close()
-        conn_manager.connection_closed(client_ip)
-
-# ==================== SERVEUR PRINCIPAL ====================
-
-def print_stats(file_handler):
-    """Affiche les statistiques périodiquement"""
-    while True:
-        time.sleep(60)  # Toutes les minutes
-        stats = file_handler.stats
-        uptime = datetime.datetime.now() - datetime.datetime.fromisoformat(stats['start_time'])
-        
-        logger.info("-" * 60)
-        logger.info(f"STATISTIQUES - Uptime: {str(uptime).split('.')[0]}")
-        logger.info(f"  Fichiers reçus: {stats['total_files']}")
-        logger.info(f"  Données totales: {stats['total_bytes'] / 1024 / 1024:.1f} MB")
-        logger.info(f"  Appareils actifs: {len(stats['devices'])}")
-        
-        # Top 5 appareils
-        if stats['devices']:
-            logger.info("  Top appareils:")
-            top_devices = sorted(stats['devices'].items(), key=lambda x: x[1], reverse=True)[:5]
-            for device, count in top_devices:
-                logger.info(f"    {device}: {count} fichiers")
-        logger.info("-" * 60)
-
-def start_server():
-    """Démarre le serveur"""
-    
-    # Initialiser les gestionnaires
-    file_handler = FileHandler()
-    conn_manager = ConnectionManager()
-    
-    # Créer le socket
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
-    
-    try:
-        server.bind((HOST, PORT))
-        server.listen(100)
-        
-        logger.info("=" * 60)
-        logger.info("SERVEUR AUDIO RAW DÉMARRÉ")
-        logger.info("=" * 60)
-        logger.info(f"Hôte: {HOST}:{PORT}")
-        logger.info(f"Stockage: {BASE_DIR}")
-        logger.info(f"Connexions max: {MAX_CONNECTIONS}")
-        logger.info("=" * 60)
-        
-        # Thread pool pour les connexions
-        executor = ThreadPoolExecutor(max_workers=50)
-        
-        # Thread pour les statistiques
-        threading.Thread(target=print_stats, args=(file_handler,), daemon=True).start()
-        
-        # Boucle principale
-        while True:
-            client, address = server.accept()
-            executor.submit(handle_client, client, address, file_handler, conn_manager)
+            # Set initial timeout for header
+            client_socket.settimeout(10.0)
             
-    except KeyboardInterrupt:
-        logger.info("Arrêt demandé...")
-    except Exception as e:
-        logger.error(f"Erreur serveur: {e}")
-    finally:
-        server.close()
-        executor.shutdown(wait=False)
-        logger.info("Serveur arrêté")
+            # Receive header
+            header_data = b''
+            while b'\n' not in header_data:
+                chunk = client_socket.recv(1024)
+                if not chunk:
+                    break
+                header_data += chunk
+            
+            if not header_data:
+                logging.warning("No data received from client")
+                return
+            
+            # Parse header
+            filename, file_size, device_id, header_size = self.parse_header(header_data)
+            
+            if not filename or file_size is None:
+                logging.error("Invalid header format")
+                return
+            
+            # Validate file size (max 10MB)
+            if file_size > 10 * 1024 * 1024:
+                logging.error(f"File too large: {file_size} bytes from {client_address}")
+                return
+            
+            logging.info(f"Expecting file: {filename} ({file_size} bytes) from device {device_id or client_ip}")
+            
+            # Extract file data from header buffer and receive remaining data
+            file_data_from_header = header_data[header_size:]
+            remaining_size = file_size - len(file_data_from_header)
+            
+            if remaining_size > 0:
+                remaining_data = self.receive_file_data(client_socket, remaining_size, header_size)
+                if remaining_data is None:
+                    logging.error("Failed to receive file data")
+                    return
+                file_data = file_data_from_header + remaining_data
+            else:
+                file_data = file_data_from_header
+            
+            if len(file_data) != file_size:
+                logging.error(f"Incomplete file: {filename} (expected {file_size}, got {len(file_data)})")
+                return
+            
+            # Queue file for processing with device ID
+            unique_filename = self.file_processor.queue_file(filename, file_data, client_address, device_id)
+            
+            if unique_filename:
+                # Send acknowledgment
+                ack_msg = f"ACK:File {filename} received successfully for device {device_id or client_ip}\n"
+                client_socket.send(ack_msg.encode())
+                self.stats['files_received'] += 1
+                logging.info(f"SUCCESS - Queued: {filename} from device {device_id or client_ip}")
+            else:
+                error_msg = f"ERROR:Server busy, please retry\n"
+                client_socket.send(error_msg.encode())
+                
+        except socket.timeout:
+            logging.error(f"Timeout handling client {client_address}")
+        except Exception as e:
+            logging.error(f"Error handling client {client_address}: {e}")
+            self.stats['errors'] += 1
+        finally:
+            client_socket.close()
+            self.connection_manager.connection_closed(client_ip)
+    
+    def print_device_stats(self):
+        """Print current device statistics"""
+        stats = self.device_manager.get_device_stats()
+        logging.info(f"DEVICE STATISTICS - Total devices: {stats['total_devices']}")
+        
+        for device_key, device_info in stats['devices'].items():
+            logging.info(f"  {device_key}: {device_info['files_received']} files, last seen: {device_info['last_seen'][:19]}")
+    
+    def start_server(self):
+        """Start the high-performance file server"""
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        
+        # Increase buffer sizes
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        
+        # Use thread pool for connection handling
+        connection_pool = ThreadPoolExecutor(max_workers=200)
+        
+        try:
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(1000)  # Large backlog
+            self.running = True
+            self.stats['start_time'] = datetime.datetime.now()
+            
+            logging.info(f"HIGH-PERFORMANCE OPUS FILE SERVER STARTED")
+            logging.info(f"Host: {self.host}:{self.port}")
+            logging.info(f"Base directory: {self.device_manager.base_directory.absolute()}")
+            logging.info(f"Max connections: {self.connection_manager.max_connections}")
+            logging.info(f"Max workers: {50}")  # File processor workers
+            logging.info("Waiting for connections...")
+            # Statistics thread
+            def print_stats():
+                while self.running:
+                    time.sleep(300)  # Print stats every 5 minutes
+                    uptime = datetime.datetime.now() - self.stats['start_time']
+                    logging.info(
+                        f"STATISTICS - Uptime: {uptime}, "
+                        f"Files: {self.stats['files_received']}, "
+                        f"Connections: {self.stats['connections_handled']}, "
+                        f"Errors: {self.stats['errors']}, "
+                        f"Queue: {self.file_processor.file_queue.qsize()}"
+                    )
+                    self.print_device_stats()
+            
+            threading.Thread(target=print_stats, daemon=True).start()
+            
+            while self.running:
+                try:
+                    client_socket, client_address = self.server_socket.accept()
+                    # Submit connection handling to thread pool
+                    connection_pool.submit(self.handle_client, client_socket, client_address)
+                    
+                except KeyboardInterrupt:
+                    break
+                except Exception as e:
+                    logging.error(f"Accept error: {e}")
+                    continue
+        except Exception as e:
+            logging.error(f"Server error: {e}")
+        finally:
+            self.running = False
+            connection_pool.shutdown(wait=True)
+            self.file_processor.stop()
+            if self.server_socket:
+                self.server_socket.close()
+            logging.info("Server closed")
 
-# ==================== POINT D'ENTRÉE ====================
+def main():
+    # Configuration for high scalability
+    HOST = '0.0.0.0'
+    PORT = 40500
+    BASE_DIR = 'devices'
+    MAX_CONNECTIONS = 10000
+    MAX_WORKERS = 100
+    
+    # Create and start server
+    server = OpusFileServer(
+        host=HOST, 
+        port=PORT, 
+        base_directory=BASE_DIR,
+        max_connections=MAX_CONNECTIONS,
+        max_workers=MAX_WORKERS
+    )
+    server.start_server()
 
 if __name__ == "__main__":
-    import time
-    start_server()
+    main()
