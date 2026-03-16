@@ -11,6 +11,48 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 import hashlib
 import json
+import re
+
+
+def recover_imei_from_derived_id(derived_id, preferred_length=15):
+    """Recover IMEI candidates from firmware-derived device IDs.
+
+    Firmware format: BX + 10 base36 chars, where base36 encodes IMEI digits
+    as a decimal integer. Integer encoding drops leading zeros, so reverse
+    decoding can produce multiple valid zero-padded candidates.
+    """
+    if not isinstance(derived_id, str):
+        raise ValueError("derived_id must be a string")
+
+    candidate = derived_id.strip().upper()
+    if not re.fullmatch(r"BX[0-9A-Z]{10}", candidate):
+        raise ValueError("Invalid derived ID format; expected BX + 10 base36 chars")
+
+    base36_part = candidate[2:]
+    raw_decimal = str(int(base36_part, 36))
+
+    imei_candidates = []
+    for length in (14, 15, 16, 17):
+        if len(raw_decimal) <= length:
+            imei_candidates.append(raw_decimal.zfill(length))
+
+    if len(raw_decimal) > 17:
+        imei_candidates.insert(0, raw_decimal)
+
+    primary = raw_decimal
+    if len(raw_decimal) <= preferred_length:
+        primary = raw_decimal.zfill(preferred_length)
+
+    return {
+        "primary": primary,
+        "candidates": imei_candidates,
+        "raw_decimal": raw_decimal,
+    }
+
+
+def recover_imei_primary(derived_id):
+    """Return best-guess 15-digit IMEI from BX derived ID."""
+    return recover_imei_from_derived_id(derived_id, preferred_length=15)["primary"]
 
 # Configure logging
 logging.basicConfig(
@@ -50,14 +92,32 @@ class DeviceManager:
                 json.dump(self.device_folders, f, indent=2)
         except Exception as e:
             logging.error(f"Error saving device info: {e}")
+
+    def normalize_device_id(self, device_id):
+        """Normalize incoming device IDs while keeping backward compatibility."""
+        if not device_id:
+            return None
+
+        candidate = device_id.strip()
+        if not candidate:
+            return None
+
+        # New firmware IDs: BX + 10 base36 characters.
+        if re.fullmatch(r'(?i)bx[0-9a-z]{10}', candidate):
+            return candidate.upper()
+
+        # Legacy IDs are accepted but sanitized for filesystem safety.
+        safe = re.sub(r'[^A-Za-z0-9._-]', '_', candidate)
+        return safe[:64] if safe else None
     
     def get_device_folder(self, client_address, device_id=None):
         """Get or create folder for a specific device"""
         client_ip = client_address[0]
+        normalized_device_id = self.normalize_device_id(device_id)
         
         # Use provided device ID or generate one from IP
-        if device_id:
-            device_key = device_id
+        if normalized_device_id:
+            device_key = normalized_device_id
         else:
             device_key = f"device_{client_ip.replace('.', '_')}"
         
@@ -65,23 +125,67 @@ class DeviceManager:
             if device_key not in self.device_folders:
                 # Create new device entry
                 folder_name = device_key
-                folder_path = self.devices_directory / folder_name
-                folder_path.mkdir(parents=True, exist_ok=True)
-                
-                self.device_folders[device_key] = {
+                device_entry = {
                     'folder_name': folder_name,
-                    'folder_path': str(folder_path),
+                    'folder_path': None,  # Will be set after IMEI recovery
                     'ip_address': client_ip,
                     'first_seen': datetime.datetime.now().isoformat(),
                     'last_seen': datetime.datetime.now().isoformat(),
-                    'files_received': 0
+                    'files_received': 0,
+                    'device_id_format': None,
+                    'derived_imei': None
                 }
+                
+                # If device ID is in BX format, recover and store the IMEI
+                if normalized_device_id and re.fullmatch(r'BX[0-9A-Z]{10}', normalized_device_id):
+                    device_entry['device_id_format'] = 'BX-derived'
+                    try:
+                        device_entry['derived_imei'] = recover_imei_primary(normalized_device_id)
+                        # Create folder name with device ID + last 5 digits of IMEI
+                        last_5_imei = device_entry['derived_imei'][-5:] if device_entry['derived_imei'] else "00000"
+                        folder_name = f"{normalized_device_id}_{last_5_imei}"
+                        device_entry['folder_name'] = folder_name
+                        logging.info(f"Created new device: {folder_name}, Derived IMEI: {device_entry['derived_imei']}")
+                    except Exception as e:
+                        logging.error(f"Failed to recover IMEI from {normalized_device_id}: {e}")
+                        device_entry['folder_name'] = folder_name
+                else:
+                    device_entry['device_id_format'] = 'legacy'
+                    logging.info(f"Created new device (legacy ID): {folder_name}")
+                
+                # Create the folder with the final name
+                folder_path = self.devices_directory / device_entry['folder_name']
+                folder_path.mkdir(parents=True, exist_ok=True)
+                device_entry['folder_path'] = str(folder_path)
+                
+                self.device_folders[device_key] = device_entry
                 self.save_device_info()
-                logging.info(f"Created new device folder: {folder_name} for IP {client_ip}")
             else:
-                # Update last seen timestamp
+                # Update last seen timestamp and IP address
                 self.device_folders[device_key]['last_seen'] = datetime.datetime.now().isoformat()
                 self.device_folders[device_key]['ip_address'] = client_ip
+                
+                # If no IMEI was recovered yet and device ID is BX format, try to recover it now
+                if (self.device_folders[device_key].get('derived_imei') is None 
+                    and normalized_device_id 
+                    and re.fullmatch(r'BX[0-9A-Z]{10}', normalized_device_id)):
+                    try:
+                        self.device_folders[device_key]['derived_imei'] = recover_imei_primary(normalized_device_id)
+                        self.device_folders[device_key]['device_id_format'] = 'BX-derived'
+                        # Update folder name if IMEI was just recovered
+                        if not self.device_folders[device_key]['folder_name'].endswith('_' + self.device_folders[device_key]['derived_imei'][-5:]):
+                            last_5_imei = self.device_folders[device_key]['derived_imei'][-5:]
+                            new_folder_name = f"{normalized_device_id}_{last_5_imei}"
+                            old_folder_path = Path(self.device_folders[device_key]['folder_path'])
+                            new_folder_path = self.devices_directory / new_folder_name
+                            # Rename the folder if it has changed
+                            if old_folder_path != new_folder_path and old_folder_path.exists():
+                                old_folder_path.rename(new_folder_path)
+                                self.device_folders[device_key]['folder_name'] = new_folder_name
+                                self.device_folders[device_key]['folder_path'] = str(new_folder_path)
+                                logging.info(f"Renamed device folder from {old_folder_path.name} to {new_folder_name}")
+                    except Exception as e:
+                        logging.error(f"Failed to recover IMEI from {normalized_device_id}: {e}")
             
             return Path(self.device_folders[device_key]['folder_path'])
     
@@ -152,6 +256,9 @@ class FileProcessor:
             device_folder = self.device_manager.get_device_folder(client_address, device_id)
             device_key = device_folder.name
             
+            # Get device information including recovered IMEI
+            device_info = self.device_manager.device_folders.get(device_key, {})
+            
             # Add timestamp to avoid conflicts
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             
@@ -168,6 +275,8 @@ class FileProcessor:
                 'client_address': client_address,
                 'device_folder': device_folder,
                 'device_key': device_key,
+                'device_id_format': device_info.get('device_id_format'),
+                'derived_imei': device_info.get('derived_imei'),
                 'timestamp': timestamp
             }
             
@@ -207,7 +316,9 @@ class FileProcessor:
             # Update device statistics
             self.device_manager.increment_file_count(file_info['device_key'])
             
-            logging.info(f"SUCCESS - Saved: {file_info['filename']} ({file_size} bytes) to device {file_info['device_key']} from {file_info['client_address']}")
+            # Build log message with IMEI if available
+            imei_str = f", IMEI: {file_info.get('derived_imei')}" if file_info.get('derived_imei') else ""
+            logging.info(f"SUCCESS - Saved: {file_info['filename']} ({file_size} bytes) to device {file_info['device_key']}{imei_str} from {file_info['client_address']}")
             
             # Verify file integrity
             if self.verify_file(file_path, file_size):
@@ -233,6 +344,8 @@ class FileProcessor:
                 'source_file': file_info['original_filename'],
                 'saved_file': file_info['filename'],
                 'device_id': file_info['device_key'],
+                'device_id_format': file_info.get('device_id_format'),
+                'derived_imei': file_info.get('derived_imei'),
                 'received_at': datetime.datetime.now().isoformat(),
                 'audio_file': None,
                 'latitude': None,
@@ -278,8 +391,10 @@ class FileProcessor:
                 json.dump(parsed, jf, indent=2)
 
             logging.info(
-                "METADATA - Parsed %s: lat=%s lon=%s ble=%d",
+                "METADATA - Parsed %s: device_id=%s imei=%s lat=%s lon=%s ble=%d",
                 file_info['filename'],
+                file_info['device_key'],
+                file_info.get('derived_imei', 'N/A'),
                 parsed['latitude'],
                 parsed['longitude'],
                 len(parsed['bluetooth_devices'])
@@ -409,7 +524,11 @@ class OpusFileServer:
                 logging.error(f"File too large: {file_size} bytes from {client_address}")
                 return
             
-            logging.info(f"Expecting file: {filename} ({file_size} bytes) from device {device_id or client_ip}")
+            # Log incoming file with device ID
+            if device_id:
+                logging.info(f"Expecting file: {filename} ({file_size} bytes) from device {device_id}")
+            else:
+                logging.info(f"Expecting file: {filename} ({file_size} bytes) from {client_ip} (no device ID)")
             
             # Extract file data from header buffer and receive remaining data
             file_data_from_header = header_data[header_size:]
@@ -456,7 +575,12 @@ class OpusFileServer:
         logging.info(f"DEVICE STATISTICS - Total devices: {stats['total_devices']}")
         
         for device_key, device_info in stats['devices'].items():
-            logging.info(f"  {device_key}: {device_info['files_received']} files, last seen: {device_info['last_seen'][:19]}")
+            imei_info = ""
+            if device_info.get('derived_imei'):
+                imei_info = f", IMEI: {device_info['derived_imei']}"
+            
+            device_format = device_info.get('device_id_format', 'unknown')
+            logging.info(f"  {device_key} ({device_format}): {device_info['files_received']} files, last seen: {device_info['last_seen'][:19]}{imei_info}")
     
     def start_server(self):
         """Start the high-performance file server"""
