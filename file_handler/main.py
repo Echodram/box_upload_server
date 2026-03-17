@@ -646,9 +646,9 @@ class OpusFileServer:
 
 def main():
     # Configuration for high scalability
-    HOST = '0.0.0.0'
-    PORT = 40500
-    BASE_DIR = 'devices'
+    HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
+    PORT = int(os.environ.get('SERVER_PORT', '40500'))
+    BASE_DIR = os.environ.get('BASE_DIR', 'devices')
     MAX_CONNECTIONS = 10000
     MAX_WORKERS = 100
     

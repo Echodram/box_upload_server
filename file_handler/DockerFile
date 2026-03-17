@@ -1,11 +1,11 @@
-# Use Python 3.9 slim image
-FROM python:3.9-alpine
+# Use Python 3.9 slim image (Debian-based so apt-get works)
+FROM python:3.9-slim
 
 # Set working directory
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     gcc \
     g++ \
@@ -13,12 +13,6 @@ RUN apt-get update && apt-get install -y \
 
 # Create necessary directories
 RUN mkdir -p /app/audio_files /app/converted /app/logs
-
-# Copy requirements first (for better caching)
-COPY requirements.txt .
-
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY main.py .

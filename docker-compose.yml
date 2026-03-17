@@ -1,0 +1,96 @@
+# docker-compose.yml
+#
+# Services
+# ────────
+# server   – Python TCP upload server (receives .opus + metadata from ESP32)
+# indexer  – Go app that watches the shared volume and indexes files into MongoDB
+# mongo    – MongoDB (data lives in a dedicated named volume, not the container)
+#
+# Shared volume
+# ─────────────
+# "audio_data" is a named volume mounted into both server and indexer so the
+# indexer can read every file the server writes without any network round-trip.
+#
+# Usage
+# ─────
+#   docker compose up --build -d
+#   docker compose logs -f indexer       # watch indexing progress
+#   docker compose exec mongo mongosh    # open a shell on the database
+
+services:
+
+  # ── Python upload server ────────────────────────────────────────────────────
+  server:
+    build:
+      context: ./file_handler
+      dockerfile: DockerFile
+    container_name: box_server
+    restart: unless-stopped
+    ports:
+      - "40500:40500"       # ESP32 devices connect here
+    volumes:
+      - audio_data:/app/devices  # server writes device sub-folders here
+    environment:
+      PYTHONUNBUFFERED: "1"
+      SERVER_HOST: "0.0.0.0"
+      SERVER_PORT: "40500"
+      BASE_DIR: "/app/devices"
+    networks:
+      - box_net
+
+  # ── Go indexer ──────────────────────────────────────────────────────────────
+  indexer:
+    build:
+      context: ./indexer
+      dockerfile: Dockerfile
+    container_name: box_indexer
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    volumes:
+      - audio_data:/data/devices:ro  # read-only; server owns the writes
+    environment:
+      DATA_DIR: /data/devices
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: boxuploader
+    networks:
+      - box_net
+
+  # ── MongoDB ─────────────────────────────────────────────────────────────────
+  # Runs as its own container following Docker best-practice (one process per
+  # container).  All persistent data lives in the named volume "mongo_data" so
+  # it survives container restarts and image rebuilds.
+  mongo:
+    image: mongo:7.0
+    container_name: box_mongo
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db          # persistent database storage
+      - mongo_config:/data/configdb  # replica-set config (future-proof)
+    environment:
+      # Remove MONGO_INITDB_ROOT_* to run without auth inside the private
+      # box_net network.  Add credentials here and in MONGO_URI above if the
+      # port is ever exposed to the host.
+      MONGO_INITDB_DATABASE: boxuploader
+    # Do NOT expose port 27017 to the host; only services on box_net can reach
+    # it, which is intentional for security.
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - box_net
+
+# ── Named volumes ──────────────────────────────────────────────────────────────
+volumes:
+  audio_data:      # shared between server (rw) and indexer (ro)
+  mongo_data:      # MongoDB WAL + collections
+  mongo_config:    # MongoDB config / replica metadata
+
+# ── Network ────────────────────────────────────────────────────────────────────
+networks:
+  box_net:
+    driver: bridge
