@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}BoxUploader{% endblock %}</title>
+  <style>
+    /* ── reset / base ──────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      min-height: 100vh;
+    }
+    a { color: #63b3ed; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ── nav ────────────────────────────────────────────────────────────── */
+    nav {
+      background: #1a1d27;
+      border-bottom: 1px solid #2d3148;
+      padding: 0 1.5rem;
+      display: flex;
+      align-items: center;
+      gap: 1.5rem;
+      height: 52px;
+    }
+    nav .brand {
+      font-weight: 700;
+      font-size: 1.1rem;
+      color: #90cdf4;
+      letter-spacing: .03em;
+    }
+    nav a { font-size: .9rem; color: #a0aec0; }
+    nav a:hover { color: #e2e8f0; text-decoration: none; }
+
+    /* ── layout ─────────────────────────────────────────────────────────── */
+    .container { max-width: 1100px; margin: 0 auto; padding: 2rem 1.25rem; }
+
+    /* ── cards ──────────────────────────────────────────────────────────── */
+    .card {
+      background: #1a1d27;
+      border: 1px solid #2d3148;
+      border-radius: 10px;
+      padding: 1.25rem 1.5rem;
+      margin-bottom: 1rem;
+    }
+    .card-title { font-size: 1rem; font-weight: 600; color: #90cdf4; margin-bottom: .3rem; }
+
+    /* ── badge ──────────────────────────────────────────────────────────── */
+    .badge {
+      display: inline-block;
+      font-size: .7rem;
+      font-weight: 600;
+      padding: .15rem .5rem;
+      border-radius: 20px;
+      background: #2d3148;
+      color: #90cdf4;
+      margin-left: .4rem;
+      vertical-align: middle;
+    }
+    .badge-green { background: #1c4532; color: #68d391; }
+    .badge-yellow { background: #44371a; color: #f6e05e; }
+
+    /* ── table ──────────────────────────────────────────────────────────── */
+    table { width: 100%; border-collapse: collapse; font-size: .875rem; }
+    th { text-align: left; padding: .6rem .75rem; color: #718096;
+         border-bottom: 1px solid #2d3148; font-weight: 600; }
+    td { padding: .65rem .75rem; border-bottom: 1px solid #1e2130; vertical-align: middle; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #1e2234; }
+
+    /* ── audio player ───────────────────────────────────────────────────── */
+    audio {
+      width: 100%;
+      height: 38px;
+      accent-color: #63b3ed;
+      border-radius: 6px;
+    }
+
+    /* ── pagination ─────────────────────────────────────────────────────── */
+    .pagination { display: flex; gap: .5rem; margin-top: 1.25rem; flex-wrap: wrap; }
+    .pagination a, .pagination span {
+      padding: .35rem .75rem;
+      border-radius: 6px;
+      background: #1e2234;
+      border: 1px solid #2d3148;
+      font-size: .85rem;
+      color: #a0aec0;
+    }
+    .pagination a:hover { background: #2d3148; color: #e2e8f0; text-decoration: none; }
+    .pagination .active { background: #2b4a7a; border-color: #63b3ed; color: #fff; }
+
+    /* ── stat grid ──────────────────────────────────────────────────────── */
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: .85rem;
+      margin-bottom: 1.5rem;
+    }
+    .stat { background: #1a1d27; border: 1px solid #2d3148; border-radius: 8px;
+            padding: .9rem 1rem; }
+    .stat-value { font-size: 1.6rem; font-weight: 700; color: #90cdf4; }
+    .stat-label { font-size: .75rem; color: #718096; margin-top: .15rem; }
+
+    /* ── misc ───────────────────────────────────────────────────────────── */
+    .muted { color: #718096; font-size: .8rem; }
+    h1 { font-size: 1.4rem; font-weight: 700; margin-bottom: 1.25rem; }
+    h2 { font-size: 1.1rem; font-weight: 600; margin-bottom: .75rem; color: #cbd5e0; }
+    .gps-icon { color: #68d391; }
+  </style>
+</head>
+<body>
+  <nav>
+    <span class="brand">📡 BoxUploader</span>
+    <a href="/">Devices</a>
+  </nav>
+  <div class="container">
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>

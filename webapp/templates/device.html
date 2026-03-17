@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block title %}{{ device.folder_name }} – BoxUploader{% endblock %}
+
+{% block content %}
+<p class="muted" style="margin-bottom:.5rem;">
+  <a href="/">← All devices</a>
+</p>
+<h1>
+  {{ device.folder_name }}
+  {% if device.id_format == 'BX-derived' %}
+    <span class="badge badge-green">BX-derived</span>
+  {% else %}
+    <span class="badge">legacy</span>
+  {% endif %}
+</h1>
+
+<div class="stat-grid">
+  <div class="stat">
+    <div class="stat-value">{{ device.recording_count or 0 }}</div>
+    <div class="stat-label">Recordings</div>
+  </div>
+  {% if device.derived_imei %}
+  <div class="stat">
+    <div class="stat-value" style="font-size:1rem; padding-top:.35rem;">
+      {{ device.derived_imei }}
+    </div>
+    <div class="stat-label">IMEI</div>
+  </div>
+  {% endif %}
+  <div class="stat">
+    <div class="stat-value" style="font-size:.9rem; padding-top:.55rem;">
+      {{ device.first_indexed or '—' }}
+    </div>
+    <div class="stat-label">First indexed</div>
+  </div>
+  <div class="stat">
+    <div class="stat-value" style="font-size:.9rem; padding-top:.55rem;">
+      {{ device.last_indexed or '—' }}
+    </div>
+    <div class="stat-label">Last indexed</div>
+  </div>
+</div>
+
+<h2>Recordings ({{ total }})</h2>
+
+{% if recordings %}
+<div class="card" style="padding:0; overflow:hidden;">
+  <table>
+    <thead>
+      <tr>
+        <th>File</th>
+        <th>Recorded at</th>
+        <th>Size</th>
+        <th>GPS</th>
+        <th style="width:40%">Player</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in recordings %}
+      <tr>
+        <td>
+          <a href="/recording/{{ r.audio_path }}" title="{{ r.audio_path }}">
+            {{ r.audio_filename }}
+          </a>
+        </td>
+        <td class="muted">{{ r.recorded_at or '—' }}</td>
+        <td class="muted">
+          {% if r.file_size_bytes %}
+            {{ (r.file_size_bytes / 1024) | round(1) }} KB
+          {% else %}—{% endif %}
+        </td>
+        <td>
+          {% if r.has_gps %}
+            <span class="gps-icon" title="{{ r.latitude }}, {{ r.longitude }}">📍</span>
+          {% else %}
+            <span class="muted">—</span>
+          {% endif %}
+        </td>
+        <td>
+          <audio controls preload="none">
+            <source src="/audio/{{ r.audio_path }}" type="audio/ogg; codecs=opus">
+            Your browser doesn't support Opus audio.
+          </audio>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- pagination -->
+{% if pages > 1 %}
+<div class="pagination">
+  {% if page > 1 %}
+    <a href="/device/{{ device.folder_name }}?page={{ page - 1 }}">‹ Prev</a>
+  {% endif %}
+  {% for p in range(1, pages + 1) %}
+    {% if p == page %}
+      <span class="active">{{ p }}</span>
+    {% elif p <= 3 or p >= pages - 2 or (p >= page - 2 and p <= page + 2) %}
+      <a href="/device/{{ device.folder_name }}?page={{ p }}">{{ p }}</a>
+    {% elif p == 4 or p == pages - 3 %}
+      <span>…</span>
+    {% endif %}
+  {% endfor %}
+  {% if page < pages %}
+    <a href="/device/{{ device.folder_name }}?page={{ page + 1 }}">Next ›</a>
+  {% endif %}
+</div>
+{% endif %}
+
+{% else %}
+<div class="card">
+  <p class="muted">No recordings indexed for this device yet.</p>
+</div>
+{% endif %}
+{% endblock %}

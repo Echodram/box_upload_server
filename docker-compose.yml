@@ -5,11 +5,16 @@
 # server   – Python TCP upload server (receives .opus + metadata from ESP32)
 # indexer  – Go app that watches the shared volume and indexes files into MongoDB
 # mongo    – MongoDB (data lives in a dedicated named volume, not the container)
+# webapp   – Flask dashboard
 #
-# Shared volume
+# Audio storage
 # ─────────────
-# "audio_data" is a named volume mounted into both server and indexer so the
-# indexer can read every file the server writes without any network round-trip.
+# AUDIO_DIR (default: ./devices) is a plain host directory bind-mounted into
+# every service that needs audio access.  Set it in a .env file or export it
+# before running docker compose:
+#
+#   echo 'AUDIO_DIR=/srv/boxuploader/devices' >> .env
+#   docker compose up --build -d
 #
 # Usage
 # ─────
@@ -29,7 +34,7 @@ services:
     ports:
       - "40500:40500"       # ESP32 devices connect here
     volumes:
-      - audio_data:/app/devices  # server writes device sub-folders here
+      - ${AUDIO_DIR:-./devices}:/app/devices  # host directory; rw
     environment:
       PYTHONUNBUFFERED: "1"
       SERVER_HOST: "0.0.0.0"
@@ -49,11 +54,33 @@ services:
       mongo:
         condition: service_healthy
     volumes:
-      - audio_data:/data/devices:ro  # read-only; server owns the writes
+      - ${AUDIO_DIR:-./devices}:/data/devices:ro  # host directory; ro
     environment:
       DATA_DIR: /data/devices
       MONGO_URI: mongodb://mongo:27017
       MONGO_DB: boxuploader
+    networks:
+      - box_net
+
+  # ── Flask web app ───────────────────────────────────────────────────────────
+  webapp:
+    build:
+      context: ./webapp
+      dockerfile: Dockerfile
+    container_name: box_webapp
+    restart: unless-stopped
+    ports:
+      - "5000:5000"        # browse at http://localhost:5000
+    depends_on:
+      mongo:
+        condition: service_healthy
+    volumes:
+      - ${AUDIO_DIR:-./devices}:/data/devices:ro  # host directory; ro
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: boxuploader
+      DATA_DIR: /data/devices
+      PAGE_SIZE: "20"
     networks:
       - box_net
 
@@ -85,8 +112,8 @@ services:
       - box_net
 
 # ── Named volumes ──────────────────────────────────────────────────────────────
+# audio_data is now a host bind mount (AUDIO_DIR); no named volume needed.
 volumes:
-  audio_data:      # shared between server (rw) and indexer (ro)
   mongo_data:      # MongoDB WAL + collections
   mongo_config:    # MongoDB config / replica metadata
 

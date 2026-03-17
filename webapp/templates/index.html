@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Devices – BoxUploader{% endblock %}
+
+{% block content %}
+<h1>Devices <span class="badge">{{ total }}</span></h1>
+
+{% if devices %}
+<div class="stat-grid">
+  <div class="stat">
+    <div class="stat-value">{{ total }}</div>
+    <div class="stat-label">Total devices</div>
+  </div>
+  <div class="stat">
+    <div class="stat-value">
+      {{ devices | selectattr('id_format', 'equalto', 'BX-derived') | list | length }}
+    </div>
+    <div class="stat-label">BX-derived IDs</div>
+  </div>
+  <div class="stat">
+    <div class="stat-value">
+      {{ devices | sum(attribute='recording_count') }}
+    </div>
+    <div class="stat-label">Total recordings</div>
+  </div>
+</div>
+
+<div class="card" style="padding:0; overflow:hidden;">
+  <table>
+    <thead>
+      <tr>
+        <th>Device</th>
+        <th>IMEI</th>
+        <th>Format</th>
+        <th>Recordings</th>
+        <th>Last seen</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for d in devices %}
+      <tr>
+        <td>
+          <a href="/device/{{ d.folder_name }}">{{ d.folder_name }}</a>
+        </td>
+        <td class="muted">{{ d.derived_imei or '—' }}</td>
+        <td>
+          {% if d.id_format == 'BX-derived' %}
+            <span class="badge badge-green">BX</span>
+          {% else %}
+            <span class="badge">legacy</span>
+          {% endif %}
+        </td>
+        <td>{{ d.recording_count or 0 }}</td>
+        <td class="muted">{{ d.last_indexed or '—' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% else %}
+<div class="card">
+  <p class="muted">No devices indexed yet. The indexer will populate this page
+  once recordings arrive in the shared volume.</p>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}{{ recording.audio_filename }} – BoxUploader{% endblock %}
+
+{% block content %}
+<p class="muted" style="margin-bottom:.5rem;">
+  <a href="/">← Devices</a>
+  {% if device.folder_name %}
+    &nbsp;/&nbsp; <a href="/device/{{ device.folder_name }}">{{ device.folder_name }}</a>
+  {% endif %}
+</p>
+<h1>{{ recording.audio_filename }}</h1>
+
+<!-- player -->
+<div class="card" style="margin-bottom:1.5rem;">
+  <audio controls style="width:100%; height:46px;" preload="metadata">
+    <source src="/audio/{{ recording.audio_path }}" type="audio/ogg; codecs=opus">
+    Your browser doesn't support Opus audio.
+  </audio>
+  <p class="muted" style="margin-top:.6rem; font-size:.78rem;">
+    Path: {{ recording.audio_path }}
+  </p>
+</div>
+
+<div style="display:grid; grid-template-columns: 1fr 1fr; gap:1rem;">
+  <!-- metadata -->
+  <div class="card">
+    <div class="card-title">Recording info</div>
+    <table>
+      <tr><th>Recorded at</th><td>{{ recording.recorded_at or '—' }}</td></tr>
+      <tr><th>Received at</th><td>{{ recording.received_at or '—' }}</td></tr>
+      <tr><th>File size</th>
+        <td>{{ (recording.file_size_bytes / 1024) | round(1) }} KB</td></tr>
+      <tr><th>Indexed at</th><td>{{ recording.indexed_at or '—' }}</td></tr>
+    </table>
+  </div>
+
+  <!-- device -->
+  <div class="card">
+    <div class="card-title">Device</div>
+    <table>
+      <tr><th>ID</th><td>{{ recording.device_id or '—' }}</td></tr>
+      <tr><th>Folder</th><td>{{ recording.folder_name or '—' }}</td></tr>
+      <tr><th>IMEI</th><td>{{ recording.derived_imei or '—' }}</td></tr>
+      <tr><th>Format</th>
+        <td>
+          {% if recording.device_id_format == 'BX-derived' %}
+            <span class="badge badge-green">BX-derived</span>
+          {% else %}
+            <span class="badge">legacy</span>
+          {% endif %}
+        </td>
+      </tr>
+    </table>
+  </div>
+</div>
+
+<!-- GPS -->
+{% if recording.has_gps %}
+<div class="card" style="margin-top:1rem;">
+  <div class="card-title">📍 GPS location</div>
+  <p style="margin-top:.4rem;">
+    Lat: <strong>{{ recording.latitude }}</strong>
+    &nbsp;&nbsp;
+    Lon: <strong>{{ recording.longitude }}</strong>
+    &nbsp;&nbsp;
+    <a href="https://www.openstreetmap.org/?mlat={{ recording.latitude }}&mlon={{ recording.longitude }}&zoom=15"
+       target="_blank" rel="noopener">View on map ↗</a>
+  </p>
+</div>
+{% endif %}
+
+<!-- BT devices -->
+{% if recording.bluetooth_devices and recording.bluetooth_devices | length > 0 %}
+<div class="card" style="margin-top:1rem; padding:0; overflow:hidden;">
+  <div style="padding:.9rem 1.25rem .5rem;">
+    <div class="card-title">
+      Bluetooth devices nearby
+      <span class="badge">{{ recording.bluetooth_count or recording.bluetooth_devices | length }}</span>
+    </div>
+  </div>
+  <table>
+    <thead>
+      <tr><th>Name</th><th>MAC</th></tr>
+    </thead>
+    <tbody>
+      {% for bt in recording.bluetooth_devices %}
+      <tr>
+        <td>{{ bt.name or 'UNKNOWN' }}</td>
+        <td class="muted">{{ bt.mac }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}
