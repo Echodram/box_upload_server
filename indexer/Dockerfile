@@ -3,13 +3,12 @@ FROM golang:1.22-alpine AS builder
 
 WORKDIR /src
 
-# Copy dependency manifests first (layer cache)
-COPY go.mod ./
-RUN go mod download
+# Copy the full indexer source tree so builds don't fail when files are added.
+COPY . ./
 
-# Copy source and build a fully static binary
-COPY main.go .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /indexer .
+# Resolve module graph and build a static binary.
+RUN go mod tidy && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /indexer .
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM scratch
