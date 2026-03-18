@@ -34,7 +34,7 @@ services:
     ports:
       - "40500:40500"       # ESP32 devices connect here
     volumes:
-      - ${AUDIO_DIR:-./devices}:/app/devices  # host directory; rw
+      - ${AUDIO_DIR:-./devices}:/app/devices/  # host directory; rw
     environment:
       PYTHONUNBUFFERED: "1"
       SERVER_HOST: "0.0.0.0"
