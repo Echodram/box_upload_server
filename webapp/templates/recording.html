@@ -10,6 +10,13 @@
 </p>
 <h1>{{ recording.audio_filename }}</h1>
 
+<form method="post"
+      action="{{ url_for('delete_recording', audio_path=recording.audio_path) }}"
+      onsubmit="return confirm('Delete this recording and its metadata files? This cannot be undone.');"
+      style="margin: .2rem 0 1rem;">
+  <button type="submit" class="btn-danger">Delete Recording</button>
+</form>
+
 <!-- player -->
 <div class="card" style="margin-bottom:1.5rem;">
   <audio controls style="width:100%; height:46px;" preload="metadata">

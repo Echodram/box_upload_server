@@ -6,7 +6,7 @@ SERVER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$SERVER_DIR"
 
-docker compose build --no-cache
+docker compose build 
 docker compose up -d
 
 echo

@@ -9,6 +9,8 @@ from flask import (
     jsonify,
     render_template,
     request,
+    redirect,
+    url_for,
     Response,
     stream_with_context,
 )
@@ -52,6 +54,17 @@ def _doc_to_dict(doc):
         else:
             out[k] = v
     return out
+
+
+def _resolve_safe_path(rel_path: str) -> Path:
+    """Resolve a path under DATA_DIR and block path traversal."""
+    base = DATA_DIR.resolve()
+    safe_path = (base / rel_path).resolve()
+    try:
+        safe_path.relative_to(base)
+    except ValueError:
+        abort(403)
+    return safe_path
 
 
 # ── pages ─────────────────────────────────────────────────────────────────────
@@ -118,10 +131,7 @@ def serve_audio(audio_path):
     Stream an .opus file from the shared DATA_DIR volume.
     Supports HTTP Range requests so the browser audio element can seek.
     """
-    # Prevent path traversal: resolve and enforce DATA_DIR prefix.
-    safe_path = (DATA_DIR / audio_path).resolve()
-    if not str(safe_path).startswith(str(DATA_DIR.resolve())):
-        abort(403)
+    safe_path = _resolve_safe_path(audio_path)
     if not safe_path.exists():
         abort(404)
 
@@ -178,6 +188,56 @@ def serve_audio(audio_path):
             "Content-Length": str(file_size),
         },
     )
+
+
+@app.post("/recording/<path:audio_path>/delete")
+def delete_recording(audio_path):
+    """Delete recording file(s) from disk and remove its DB entry."""
+    rec = recordings_col.find_one({"audio_path": audio_path})
+    if not rec:
+        abort(404)
+
+    safe_audio_path = _resolve_safe_path(audio_path)
+    folder_name = rec.get("folder_name")
+
+    candidates = [
+        safe_audio_path,
+        safe_audio_path.with_suffix(".txt"),
+        safe_audio_path.with_suffix(".json"),
+    ]
+
+    deleted_files = []
+    failed_files = []
+
+    for p in candidates:
+        if not p.exists():
+            continue
+        try:
+            p.unlink()
+            deleted_files.append(str(p))
+        except Exception as exc:
+            failed_files.append({"path": str(p), "error": str(exc)})
+
+    recordings_col.delete_one({"audio_path": audio_path})
+
+    if folder_name:
+        count = recordings_col.count_documents({"folder_name": folder_name})
+        devices_col.update_one(
+            {"folder_name": folder_name},
+            {"$set": {"recording_count": count, "last_indexed": datetime.now(timezone.utc)}},
+        )
+
+    if request.accept_mimetypes.best == "application/json":
+        status = 500 if failed_files else 200
+        return jsonify({
+            "ok": len(failed_files) == 0,
+            "audio_path": audio_path,
+            "deleted_files": deleted_files,
+            "failed_files": failed_files,
+        }), status
+
+    target = url_for("device", folder_name=folder_name) if folder_name else url_for("index")
+    return redirect(target, code=303)
 
 
 # ── JSON API (used by JS fetch calls) ─────────────────────────────────────────

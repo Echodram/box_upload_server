@@ -68,9 +68,12 @@ class DeviceManager:
     """Manages device folders and configurations"""
     def __init__(self, base_directory='received_files'):
         self.base_directory = Path(base_directory)
-        self.devices_directory = self.base_directory / 'devices'
+        if self.base_directory.name == 'devices':
+            self.devices_directory = self.base_directory
+        else:
+            self.devices_directory = self.base_directory / 'devices'
         self.device_folders = {}
-        self.device_info_file = self.base_directory / 'devices.json'
+        self.device_info_file = self.devices_directory / 'devices.json'
         self.lock = threading.Lock()
         self.load_device_info()
         

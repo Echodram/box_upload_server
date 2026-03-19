@@ -52,6 +52,7 @@
         <th>Recorded at</th>
         <th>Size</th>
         <th>GPS</th>
+        <th>Delete</th>
         <th style="width:40%">Player</th>
       </tr>
     </thead>
@@ -75,6 +76,13 @@
           {% else %}
             <span class="muted">—</span>
           {% endif %}
+        </td>
+        <td>
+          <form method="post"
+                action="{{ url_for('delete_recording', audio_path=r.audio_path) }}"
+                onsubmit="return confirm('Delete this recording and its metadata files?');">
+            <button type="submit" class="btn-danger">Delete</button>
+          </form>
         </td>
         <td>
           <audio controls preload="none">
