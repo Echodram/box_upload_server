@@ -1,15 +1,15 @@
-# Use Python 3.9 slim image (Debian-based so apt-get works)
-FROM python:3.9-slim
+FROM python:3.9-alpine
 
 # Set working directory
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apk add --no-cache \
     ffmpeg \
     gcc \
     g++ \
-    && rm -rf /var/lib/apt/lists/*
+    musl-dev \
+    python3-dev
 
 # Create necessary directories
 RUN mkdir -p /app/audio_files /app/converted /app/logs

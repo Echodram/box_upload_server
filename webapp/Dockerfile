@@ -1,11 +1,9 @@
-FROM python:3.11-slim
+FROM python:3.11-alpine
 
 WORKDIR /app
 
-# System deps (none needed beyond pip)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# System deps
+RUN apk add --no-cache curl
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
