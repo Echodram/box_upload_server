@@ -28,7 +28,7 @@ services:
   server:
     build:
       context: ./file_handler
-      dockerfile: DockerFile
+      dockerfile: Dockerfile
     container_name: box_server
     restart: unless-stopped
     ports:

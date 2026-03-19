@@ -1,0 +1,31 @@
+# Use Python 3.9 slim image (Debian-based so apt-get works)
+FROM python:3.9-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create necessary directories
+RUN mkdir -p /app/audio_files /app/converted /app/logs
+
+# Copy application code
+COPY main.py .
+
+
+# Expose the port
+EXPOSE 40500
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV SERVER_HOST=0.0.0.0
+ENV SERVER_PORT=40500
+ENV BASE_DIR=/app/devices
+
+# Run the server
+CMD ["python", "main.py"]
