@@ -3,12 +3,18 @@ FROM golang:1.22-alpine AS builder
 
 WORKDIR /src
 
+# Install tools needed for module fetches.
+RUN apk add --no-cache git ca-certificates
+
+# Download dependencies first for a more reliable build.
+COPY go.mod ./
+RUN go mod download
+
 # Copy the full indexer source tree so builds don't fail when files are added.
 COPY . ./
 
-# Resolve module graph and build a static binary.
-RUN go mod tidy && \
-    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /indexer .
+# Build a static binary.
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /indexer .
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM scratch
