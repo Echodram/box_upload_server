@@ -13,8 +13,9 @@ RUN go mod download
 # Copy the full indexer source tree so builds don't fail when files are added.
 COPY . ./
 
-# Build a static binary.
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /indexer .
+# Generate missing checksums if go.sum is not committed, then build.
+RUN go mod tidy && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /indexer .
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM scratch
