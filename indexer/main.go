@@ -160,6 +160,79 @@ type indexer struct {
 	recs    *mongo.Collection
 }
 
+func (ix *indexer) syncDeviceRecordingCount(ctx context.Context, folderName string) error {
+	if folderName == "" {
+		return nil
+	}
+
+	count, err := ix.recs.CountDocuments(ctx, bson.M{"folder_name": folderName})
+	if err != nil {
+		return err
+	}
+
+	_, err = ix.devices.UpdateOne(
+		ctx,
+		bson.M{"folder_name": folderName},
+		bson.M{"$set": bson.M{"recording_count": count, "last_indexed": time.Now().UTC()}},
+	)
+	return err
+}
+
+func (ix *indexer) removeRecordingByPath(ctx context.Context, audioPath string) error {
+	audioPath = filepath.ToSlash(audioPath)
+	if audioPath == "" {
+		return nil
+	}
+
+	var deleted struct {
+		FolderName string `bson:"folder_name"`
+	}
+	err := ix.recs.FindOneAndDelete(ctx, bson.M{"audio_path": audioPath}).Decode(&deleted)
+	if err == mongo.ErrNoDocuments {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	if e := ix.syncDeviceRecordingCount(ctx, deleted.FolderName); e != nil {
+		log.Printf("WARN sync count %s: %v", deleted.FolderName, e)
+	}
+
+	log.Printf("DEL   %s", audioPath)
+	return nil
+}
+
+func (ix *indexer) pruneStaleRecordings(ctx context.Context) error {
+	cursor, err := ix.recs.Find(ctx, bson.M{}, options.Find().SetProjection(bson.M{"audio_path": 1}))
+	if err != nil {
+		return err
+	}
+	defer cursor.Close(ctx)
+
+	for cursor.Next(ctx) {
+		var row struct {
+			AudioPath string `bson:"audio_path"`
+		}
+		if err := cursor.Decode(&row); err != nil {
+			log.Printf("WARN decode stale row: %v", err)
+			continue
+		}
+		if row.AudioPath == "" {
+			continue
+		}
+
+		abs := filepath.Join(ix.dataDir, filepath.FromSlash(row.AudioPath))
+		if _, err := os.Stat(abs); os.IsNotExist(err) {
+			if e := ix.removeRecordingByPath(ctx, row.AudioPath); e != nil {
+				log.Printf("WARN remove stale %s: %v", row.AudioPath, e)
+			}
+		}
+	}
+
+	return cursor.Err()
+}
+
 // ensureIndexes creates all MongoDB indexes idempotently (CreateMany is a no-op
 // for indexes that already exist when the same name and key are supplied).
 func (ix *indexer) ensureIndexes(ctx context.Context) error {
@@ -354,7 +427,7 @@ func (ix *indexer) indexOpusFile(ctx context.Context, absPath, relPath string) e
 
 // scanDir walks ix.dataDir and indexes every .opus file found.
 func (ix *indexer) scanDir(ctx context.Context) error {
-	return filepath.Walk(ix.dataDir, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(ix.dataDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Printf("WARN walk %s: %v", path, err)
 			return nil // continue
@@ -368,6 +441,16 @@ func (ix *indexer) scanDir(ctx context.Context) error {
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	// Remove DB rows whose files no longer exist on disk.
+	if err := ix.pruneStaleRecordings(ctx); err != nil {
+		log.Printf("WARN prune stale recordings: %v", err)
+	}
+
+	return nil
 }
 
 // watchDir uses fsnotify to watch ix.dataDir recursively for new or updated
@@ -403,13 +486,39 @@ func (ix *indexer) watchDir(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
+
+			path := event.Name
+			ext := strings.ToLower(filepath.Ext(path))
+
+			if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+				switch ext {
+				case ".opus":
+					rel, e := filepath.Rel(ix.dataDir, path)
+					if e == nil {
+						opCtx, cancel := context.WithTimeout(context.Background(), operationTimeout)
+						if e := ix.removeRecordingByPath(opCtx, rel); e != nil {
+							log.Printf("WARN remove %s: %v", rel, e)
+						}
+						cancel()
+					}
+				case ".json":
+					opusPath := strings.TrimSuffix(path, ".json") + ".opus"
+					rel, e := filepath.Rel(ix.dataDir, opusPath)
+					if e == nil {
+						opCtx, cancel := context.WithTimeout(context.Background(), operationTimeout)
+						if e := ix.removeRecordingByPath(opCtx, rel); e != nil {
+							log.Printf("WARN remove %s: %v", rel, e)
+						}
+						cancel()
+					}
+				}
+				continue
+			}
+
 			// Only act on Create or Write events.
 			if event.Op&(fsnotify.Create|fsnotify.Write) == 0 {
 				continue
 			}
-
-			path := event.Name
-			ext := strings.ToLower(filepath.Ext(path))
 
 			switch ext {
 			case ".opus":
