@@ -303,7 +303,6 @@ func readNextOggPacket(r io.Reader) ([]byte, bool, error) {
 			return nil, false, err
 		}
 
-		packet := make([]byte, 0, payloadSize)
 		offset := 0
 		for _, seg := range lacing {
 			n := int(seg)
