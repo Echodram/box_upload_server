@@ -100,4 +100,33 @@
   </table>
 </div>
 {% endif %}
+
+{% if recording.opustags %}
+<div class="card" style="margin-top:1rem; padding:0; overflow:hidden;">
+  <div style="padding:.9rem 1.25rem .5rem;">
+    <div class="card-title">OpusTags metadata</div>
+  </div>
+  <table>
+    <thead>
+      <tr><th>Tag</th><th>Value</th></tr>
+    </thead>
+    <tbody>
+      {% for key, values in recording.opustags.items() %}
+      <tr>
+        <td>{{ key }}</td>
+        <td>
+          {% if values is string %}
+            {{ values }}
+          {% elif values is iterable %}
+            {{ values | join(' | ') }}
+          {% else %}
+            {{ values }}
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
 {% endblock %}

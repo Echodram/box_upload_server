@@ -47,13 +47,17 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -81,6 +85,8 @@ const (
 // device IDs: e.g. "BX0A1B2C3D4E_12345"
 var bxFolderRe = regexp.MustCompile(`^(BX[0-9A-Z]{10})_([0-9]{5})$`)
 
+var btAddrRe = regexp.MustCompile(`([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})`)
+
 // ── on-disk structures ────────────────────────────────────────────────────────
 
 // metaJSON mirrors the .json companion files written by the Python server
@@ -102,6 +108,14 @@ type metaJSON struct {
 type btDevice struct {
 	Name string `bson:"name" json:"name"`
 	MAC  string `bson:"mac"  json:"mac"`
+}
+
+type opusTagMeta struct {
+	Tags            map[string][]string
+	Latitude        *float64
+	Longitude       *float64
+	BluetoothCount  int
+	BluetoothDevices []btDevice
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -150,6 +164,183 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func parseBluetoothDeviceTagValue(v string) btDevice {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return btDevice{Name: "UNKNOWN", MAC: ""}
+	}
+
+	name := v
+	mac := ""
+
+	if i := strings.Index(v, "name="); i >= 0 {
+		after := v[i+5:]
+		if j := strings.Index(after, " address="); j >= 0 {
+			name = strings.TrimSpace(after[:j])
+		} else {
+			name = strings.TrimSpace(after)
+		}
+	}
+
+	if m := btAddrRe.FindStringSubmatch(v); len(m) > 1 {
+		mac = strings.ToUpper(m[1])
+	}
+
+	if name == "" {
+		name = "UNKNOWN"
+	}
+
+	return btDevice{Name: name, MAC: mac}
+}
+
+func parseOpusTagsPacket(packet []byte) (*opusTagMeta, error) {
+	if len(packet) < 16 || string(packet[:8]) != "OpusTags" {
+		return nil, fmt.Errorf("not an OpusTags packet")
+	}
+
+	offset := 8
+	if offset+4 > len(packet) {
+		return nil, fmt.Errorf("truncated vendor length")
+	}
+	vendorLen := int(binary.LittleEndian.Uint32(packet[offset : offset+4]))
+	offset += 4
+	if offset+vendorLen > len(packet) {
+		return nil, fmt.Errorf("truncated vendor string")
+	}
+	offset += vendorLen
+
+	if offset+4 > len(packet) {
+		return nil, fmt.Errorf("truncated comment count")
+	}
+	commentCount := int(binary.LittleEndian.Uint32(packet[offset : offset+4]))
+	offset += 4
+
+	meta := &opusTagMeta{
+		Tags:            map[string][]string{},
+		BluetoothDevices: []btDevice{},
+	}
+
+	for i := 0; i < commentCount; i++ {
+		if offset+4 > len(packet) {
+			break
+		}
+		commentLen := int(binary.LittleEndian.Uint32(packet[offset : offset+4]))
+		offset += 4
+		if commentLen < 0 || offset+commentLen > len(packet) {
+			break
+		}
+		comment := string(packet[offset : offset+commentLen])
+		offset += commentLen
+
+		eq := strings.IndexByte(comment, '=')
+		if eq <= 0 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(comment[:eq]))
+		val := strings.TrimSpace(comment[eq+1:])
+		if key == "" {
+			continue
+		}
+		meta.Tags[key] = append(meta.Tags[key], val)
+
+		switch key {
+		case "gps_latitude":
+			if f, err := strconv.ParseFloat(val, 64); err == nil {
+				v := f
+				meta.Latitude = &v
+			}
+		case "gps_longitude":
+			if f, err := strconv.ParseFloat(val, 64); err == nil {
+				v := f
+				meta.Longitude = &v
+			}
+		case "bluetooth_count":
+			if n, err := strconv.Atoi(val); err == nil && n >= 0 {
+				meta.BluetoothCount = n
+			}
+		case "bluetooth_device":
+			meta.BluetoothDevices = append(meta.BluetoothDevices, parseBluetoothDeviceTagValue(val))
+		}
+	}
+
+	if meta.BluetoothCount == 0 && len(meta.BluetoothDevices) > 0 {
+		meta.BluetoothCount = len(meta.BluetoothDevices)
+	}
+
+	return meta, nil
+}
+
+func readNextOggPacket(r io.Reader) ([]byte, bool, error) {
+	packet := make([]byte, 0, 4096)
+
+	for {
+		header := make([]byte, 27)
+		if _, err := io.ReadFull(r, header); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return nil, false, io.EOF
+			}
+			return nil, false, err
+		}
+
+		if string(header[:4]) != "OggS" {
+			return nil, false, fmt.Errorf("invalid ogg capture pattern")
+		}
+
+		segCount := int(header[26])
+		lacing := make([]byte, segCount)
+		if _, err := io.ReadFull(r, lacing); err != nil {
+			return nil, false, err
+		}
+
+		payloadSize := 0
+		for _, s := range lacing {
+			payloadSize += int(s)
+		}
+		payload := make([]byte, payloadSize)
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return nil, false, err
+		}
+
+		packet := make([]byte, 0, payloadSize)
+		offset := 0
+		for _, seg := range lacing {
+			n := int(seg)
+			if n > 0 {
+				packet = append(packet, payload[offset:offset+n]...)
+			}
+			offset += n
+			if seg < 255 {
+				complete := true
+				return packet, complete, nil
+			}
+		}
+	}
+}
+
+func readOpusTags(path string) *opusTagMeta {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	// First packet should be OpusHead; second should be OpusTags.
+	_, _, err = readNextOggPacket(f)
+	if err != nil {
+		return nil
+	}
+	tagsPacket, _, err := readNextOggPacket(f)
+	if err != nil {
+		return nil
+	}
+
+	meta, err := parseOpusTagsPacket(tagsPacket)
+	if err != nil {
+		return nil
+	}
+	return meta
 }
 
 // ── indexer ───────────────────────────────────────────────────────────────────
@@ -343,6 +534,9 @@ func (ix *indexer) indexOpusFile(ctx context.Context, absPath, relPath string) e
 		meta = readMeta(jsonAbs)
 	}
 
+	// ── OpusTags (embedded metadata) ─────────────────────────────────────────
+	opusMeta := readOpusTags(absPath)
+
 	// ── timestamps ────────────────────────────────────────────────────────────
 	receivedAt := fi.ModTime().UTC()
 	recordedAt := receivedAt
@@ -360,7 +554,11 @@ func (ix *indexer) indexOpusFile(ctx context.Context, absPath, relPath string) e
 
 	// ── GPS ───────────────────────────────────────────────────────────────────
 	var lat, lon *float64
-	if meta != nil {
+	if opusMeta != nil {
+		lat = opusMeta.Latitude
+		lon = opusMeta.Longitude
+	}
+	if (lat == nil || lon == nil) && meta != nil {
 		lat = meta.Latitude
 		lon = meta.Longitude
 	}
@@ -369,7 +567,13 @@ func (ix *indexer) indexOpusFile(ctx context.Context, absPath, relPath string) e
 	// ── Bluetooth ─────────────────────────────────────────────────────────────
 	btCount := 0
 	btDevices := []btDevice{}
-	if meta != nil {
+	if opusMeta != nil {
+		btCount = opusMeta.BluetoothCount
+		if opusMeta.BluetoothDevices != nil {
+			btDevices = opusMeta.BluetoothDevices
+		}
+	}
+	if btCount == 0 && len(btDevices) == 0 && meta != nil {
 		btCount = meta.BluetoothCount
 		if meta.BluetoothDevices != nil {
 			btDevices = meta.BluetoothDevices
@@ -393,6 +597,9 @@ func (ix *indexer) indexOpusFile(ctx context.Context, absPath, relPath string) e
 		"bluetooth_devices": btDevices,
 		"meta_path":         filepath.ToSlash(jsonRel),
 		"indexed_at":        now,
+	}
+	if opusMeta != nil && len(opusMeta.Tags) > 0 {
+		doc["opustags"] = opusMeta.Tags
 	}
 	if lat != nil {
 		doc["latitude"] = *lat
