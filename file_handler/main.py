@@ -167,6 +167,16 @@ class DeviceManager:
                 # Update last seen timestamp and IP address
                 self.device_folders[device_key]['last_seen'] = datetime.datetime.now().isoformat()
                 self.device_folders[device_key]['ip_address'] = client_ip
+
+                # Recover if folder was removed or not present on disk.
+                existing_folder_path = Path(self.device_folders[device_key]['folder_path'])
+                if not existing_folder_path.exists():
+                    existing_folder_path.mkdir(parents=True, exist_ok=True)
+                    logging.warning(
+                        "Recreated missing device folder for %s at %s",
+                        device_key,
+                        existing_folder_path,
+                    )
                 
                 # If no IMEI was recovered yet and device ID is BX format, try to recover it now
                 if (self.device_folders[device_key].get('derived_imei') is None 
@@ -252,29 +262,40 @@ class FileProcessor:
         for i in range(max_workers):
             threading.Thread(target=self._process_files, daemon=True, name=f"FileProcessor-{i}").start()
     
-    def queue_file(self, filename, file_data, client_address, device_id=None):
-        """Queue a file for processing"""
+    def queue_file(self, filename, staged_path, expected_size, client_address, device_id=None):
+        """Queue a staged file for processing"""
         try:
             # Get device folder
             device_folder = self.device_manager.get_device_folder(client_address, device_id)
-            device_key = device_folder.name
+            normalized_device_id = self.device_manager.normalize_device_id(device_id)
+            if normalized_device_id:
+                device_key = normalized_device_id
+            else:
+                device_key = f"device_{client_address[0].replace('.', '_')}"
             
             # Get device information including recovered IMEI
-            device_info = self.device_manager.device_folders.get(device_key, {})
+            with self.device_manager.lock:
+                device_info = dict(self.device_manager.device_folders.get(device_key, {}))
             
             # Add timestamp to avoid conflicts
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+            safe_name = Path(filename).name
+            safe_name = re.sub(r'[^A-Za-z0-9._-]', '_', safe_name)
+            if not safe_name:
+                safe_name = "upload.bin"
             
-            name_parts = filename.rsplit('.', 1)
+            name_parts = safe_name.rsplit('.', 1)
             if len(name_parts) == 2:
                 unique_filename = f"{name_parts[0]}_{timestamp}.{name_parts[1]}"
             else:
-                unique_filename = f"{filename}_{timestamp}"
+                unique_filename = f"{safe_name}_{timestamp}"
             
             file_info = {
                 'filename': unique_filename,
                 'original_filename': filename,
-                'data': file_data,
+                'staged_path': str(staged_path),
+                'expected_size': expected_size,
                 'client_address': client_address,
                 'device_folder': device_folder,
                 'device_key': device_key,
@@ -309,12 +330,16 @@ class FileProcessor:
     def _save_file(self, file_info):
         """Save file to device-specific folder"""
         file_path = file_info['device_folder'] / file_info['filename']
+        staged_path = Path(file_info['staged_path'])
         
         try:
-            with open(file_path, 'wb') as f:
-                f.write(file_info['data'])
-            
-            file_size = len(file_info['data'])
+            # Ensure destination folder exists in case it was removed externally.
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Keep staged temp files and final files on same filesystem for atomic rename.
+            os.replace(staged_path, file_path)
+
+            file_size = file_info['expected_size']
             
             # Update device statistics
             self.device_manager.increment_file_count(file_info['device_key'])
@@ -338,6 +363,8 @@ class FileProcessor:
             logging.error(f"Error saving file {file_info['filename']}: {e}")
             if file_path.exists():
                 file_path.unlink()
+            if staged_path.exists():
+                staged_path.unlink()
             return False
 
     def process_metadata_txt(self, file_path, file_info):
@@ -427,14 +454,29 @@ class OpusFileServer:
         self.device_manager = DeviceManager(base_directory)
         self.connection_manager = ConnectionManager(max_connections)
         self.file_processor = FileProcessor(self.device_manager, max_workers)
+        self.tmp_directory = self.device_manager.base_directory / 'incoming_tmp'
+        self.tmp_directory.mkdir(parents=True, exist_ok=True)
         self.server_socket = None
         self.running = False
+        self.stats_lock = threading.Lock()
         self.stats = {
             'files_received': 0,
             'connections_handled': 0,
             'errors': 0,
             'start_time': None
         }
+
+    def _inc_stat(self, key, amount=1):
+        with self.stats_lock:
+            self.stats[key] += amount
+
+    def _set_start_time(self, value):
+        with self.stats_lock:
+            self.stats['start_time'] = value
+
+    def _stats_snapshot(self):
+        with self.stats_lock:
+            return dict(self.stats)
     
     def parse_header(self, data):
         """Parse the header data to extract filename, size, and device ID"""
@@ -462,30 +504,42 @@ class OpusFileServer:
             logging.error(f"Error parsing header: {e}")
             return None, None, None, 0
     
-    def receive_file_data(self, client_socket, file_size, header_size):
-        """Receive file data with timeout and chunking"""
+    def receive_file_to_temp(self, client_socket, temp_file_path, initial_data, total_size):
+        """Receive file bytes directly to a temp file to avoid large RAM buffers."""
         try:
             client_socket.settimeout(30.0)  # 30 second timeout for data transfer
-            
-            bytes_received = 0
-            file_data = bytearray()
-            
-            while bytes_received < file_size:
-                chunk_size = min(8192, file_size - bytes_received)
-                chunk = client_socket.recv(chunk_size)
-                if not chunk:
-                    break
-                file_data.extend(chunk)
-                bytes_received += len(chunk)
-            
-            return bytes(file_data)
-            
+
+            bytes_written = 0
+            with open(temp_file_path, 'wb') as tempf:
+                if initial_data:
+                    allowed = initial_data[:total_size]
+                    tempf.write(allowed)
+                    bytes_written += len(allowed)
+
+                while bytes_written < total_size:
+                    chunk_size = min(8192, total_size - bytes_written)
+                    chunk = client_socket.recv(chunk_size)
+                    if not chunk:
+                        break
+                    tempf.write(chunk)
+                    bytes_written += len(chunk)
+
+            return bytes_written == total_size
+
         except socket.timeout:
             logging.error("Timeout while receiving file data")
-            return None
+            return False
         except Exception as e:
             logging.error(f"Error receiving file data: {e}")
-            return None
+            return False
+
+    def _make_staging_path(self, client_address, filename):
+        safe_name = Path(filename).name
+        safe_name = re.sub(r'[^A-Za-z0-9._-]', '_', safe_name)
+        if not safe_name:
+            safe_name = 'upload.bin'
+        stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        return self.tmp_directory / f"{client_address[0].replace('.', '_')}_{stamp}_{safe_name}.part"
     
     def handle_client(self, client_socket, client_address):
         """Handle a single client connection"""
@@ -498,18 +552,22 @@ class OpusFileServer:
         
         try:
             logging.info(f"New connection from: {client_address}")
-            self.stats['connections_handled'] += 1
+            self._inc_stat('connections_handled')
             
             # Set initial timeout for header
             client_socket.settimeout(10.0)
             
             # Receive header
             header_data = b''
+            max_header_bytes = 4096
             while b'\n' not in header_data:
                 chunk = client_socket.recv(1024)
                 if not chunk:
                     break
                 header_data += chunk
+                if len(header_data) > max_header_bytes:
+                    logging.error(f"Header too large from {client_address}")
+                    return
             
             if not header_data:
                 logging.warning("No data received from client")
@@ -533,33 +591,37 @@ class OpusFileServer:
             else:
                 logging.info(f"Expecting file: {filename} ({file_size} bytes) from {client_ip} (no device ID)")
             
-            # Extract file data from header buffer and receive remaining data
+            # Extract file data from header buffer and stream remaining bytes to disk.
             file_data_from_header = header_data[header_size:]
-            remaining_size = file_size - len(file_data_from_header)
-            
-            if remaining_size > 0:
-                remaining_data = self.receive_file_data(client_socket, remaining_size, header_size)
-                if remaining_data is None:
-                    logging.error("Failed to receive file data")
-                    return
-                file_data = file_data_from_header + remaining_data
-            else:
-                file_data = file_data_from_header
-            
-            if len(file_data) != file_size:
-                logging.error(f"Incomplete file: {filename} (expected {file_size}, got {len(file_data)})")
+            if len(file_data_from_header) > file_size:
+                logging.error(f"Protocol error: header already contains more than SIZE bytes for {filename}")
+                return
+
+            staged_path = self._make_staging_path(client_address, filename)
+            if not self.receive_file_to_temp(client_socket, staged_path, file_data_from_header, file_size):
+                logging.error("Failed to receive file data")
+                if staged_path.exists():
+                    staged_path.unlink()
                 return
             
-            # Queue file for processing with device ID
-            unique_filename = self.file_processor.queue_file(filename, file_data, client_address, device_id)
+            # Queue staged file for processing with device ID
+            unique_filename = self.file_processor.queue_file(
+                filename,
+                staged_path,
+                file_size,
+                client_address,
+                device_id
+            )
             
             if unique_filename:
                 # Send acknowledgment
                 ack_msg = f"ACK:File {filename} received successfully for device {device_id or client_ip}\n"
                 client_socket.send(ack_msg.encode())
-                self.stats['files_received'] += 1
+                self._inc_stat('files_received')
                 logging.info(f"SUCCESS - Queued: {filename} from device {device_id or client_ip}")
             else:
+                if staged_path.exists():
+                    staged_path.unlink()
                 error_msg = f"ERROR:Server busy, please retry\n"
                 client_socket.send(error_msg.encode())
                 
@@ -567,7 +629,7 @@ class OpusFileServer:
             logging.error(f"Timeout handling client {client_address}")
         except Exception as e:
             logging.error(f"Error handling client {client_address}: {e}")
-            self.stats['errors'] += 1
+            self._inc_stat('errors')
         finally:
             client_socket.close()
             self.connection_manager.connection_closed(client_ip)
@@ -602,7 +664,7 @@ class OpusFileServer:
             self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(1000)  # Large backlog
             self.running = True
-            self.stats['start_time'] = datetime.datetime.now()
+            self._set_start_time(datetime.datetime.now())
             
             logging.info(f"HIGH-PERFORMANCE OPUS FILE SERVER STARTED")
             logging.info(f"Host: {self.host}:{self.port}")
@@ -614,12 +676,13 @@ class OpusFileServer:
             def print_stats():
                 while self.running:
                     time.sleep(300)  # Print stats every 5 minutes
-                    uptime = datetime.datetime.now() - self.stats['start_time']
+                    stats = self._stats_snapshot()
+                    uptime = datetime.datetime.now() - stats['start_time']
                     logging.info(
                         f"STATISTICS - Uptime: {uptime}, "
-                        f"Files: {self.stats['files_received']}, "
-                        f"Connections: {self.stats['connections_handled']}, "
-                        f"Errors: {self.stats['errors']}, "
+                        f"Files: {stats['files_received']}, "
+                        f"Connections: {stats['connections_handled']}, "
+                        f"Errors: {stats['errors']}, "
                         f"Queue: {self.file_processor.file_queue.qsize()}"
                     )
                     self.print_device_stats()

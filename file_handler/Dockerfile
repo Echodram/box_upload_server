@@ -12,7 +12,7 @@ RUN apk add --no-cache \
     python3-dev
 
 # Create necessary directories
-RUN mkdir -p /app/audio_files /app/converted /app/logs
+RUN mkdir -p /app/devices
 
 # Copy application code
 COPY main.py .
